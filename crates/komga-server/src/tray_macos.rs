@@ -144,6 +144,9 @@ thread_local! {
     static AUTOSTART_ITEM: RefCell<Option<CheckMenuItem>> = const { RefCell::new(None) };
     static UPDATE_ITEM: RefCell<Option<MenuItem>> = const { RefCell::new(None) };
     static TRAY_ICON: RefCell<Option<TrayIcon>> = const { RefCell::new(None) };
+    // the badge the icon currently shows, so it is only swapped on a change
+    static BADGE: std::cell::Cell<crate::desktop::Badge> =
+        const { std::cell::Cell::new(crate::desktop::Badge::None) };
 }
 
 pub struct Tray;
@@ -320,14 +323,27 @@ pub fn start(
         return None;
     }
     let (ready_tx, ready_rx) = mpsc::channel();
+    let initial = update.clone();
+    let follow = update.clone();
+    let mut changes = update.subscribe();
     DispatchQueue::main().exec_async(move || {
         let result = build(port, paths, shutdown, update).map(|item| {
             STATUS_ITEM.with(|slot| *slot.borrow_mut() = Some(item));
+            refresh_update_item(&initial);
         });
         let _ = ready_tx.send(result);
     });
     match ready_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(())) => Some(Tray),
+        Ok(Ok(())) => {
+            // an update the daily check finds shows up without opening the menu
+            tokio::spawn(async move {
+                while changes.changed().await.is_ok() {
+                    let update = follow.clone();
+                    DispatchQueue::main().exec_async(move || refresh_update_item(&update));
+                }
+            });
+            Some(Tray)
+        }
         Ok(Err(e)) => {
             tracing::warn!("menu bar item disabled: {e}");
             None
@@ -501,9 +517,14 @@ fn build(
 }
 
 fn load_icon() -> Result<Icon, String> {
+    load_icon_image(crate::desktop::Badge::None)
+}
+
+fn load_icon_image(badge: crate::desktop::Badge) -> Result<Icon, String> {
     let image = image::load_from_memory_with_format(MENU_BAR_ICON_PNG, image::ImageFormat::Png)
         .map_err(|e| e.to_string())?
         .into_rgba8();
+    let image = crate::desktop::badged_icon(&image, badge, true);
     let (width, height) = image.dimensions();
     Icon::from_rgba(image.into_raw(), width, height).map_err(|e| e.to_string())
 }
@@ -605,9 +626,19 @@ fn refresh_update_item(update: &crate::service::desktop_update::DesktopUpdate) {
             let status = update.status();
             item.set_text(crate::desktop::status_label(&status));
             item.set_enabled(!crate::desktop::busy(&status));
+            let badge = crate::desktop::update_badge(&status, update.pending());
             TRAY_ICON.with(|slot| {
                 if let Some(icon) = slot.borrow().as_ref() {
                     let _ = icon.set_tooltip(Some(crate::desktop::tooltip(&status)));
+                    if let Some(badge) = badge.filter(|badge| *badge != BADGE.get()) {
+                        match load_icon_image(badge) {
+                            Ok(image) => {
+                                let _ = icon.set_icon_templated(Some(image));
+                                BADGE.set(badge);
+                            }
+                            Err(e) => tracing::warn!("menu bar icon decode: {e}"),
+                        }
+                    }
                 }
             });
         }

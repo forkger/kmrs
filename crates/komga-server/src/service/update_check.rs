@@ -26,16 +26,43 @@ pub struct CheckOutcome {
 }
 
 /// Shared outcome of the update check: `None` until the first successful run.
-#[derive(Debug, Clone, Default)]
-pub struct LatestUpdate(Arc<std::sync::RwLock<Option<CheckOutcome>>>);
+#[derive(Debug, Clone)]
+pub struct LatestUpdate {
+    outcome: Arc<std::sync::RwLock<Option<CheckOutcome>>>,
+    // the newest version found, for the desktop menu; changes only when the version does
+    found: Arc<tokio::sync::watch::Sender<Option<String>>>,
+}
+
+impl Default for LatestUpdate {
+    fn default() -> Self {
+        Self {
+            outcome: Arc::default(),
+            found: Arc::new(tokio::sync::watch::channel(None).0),
+        }
+    }
+}
 
 impl LatestUpdate {
     pub fn get(&self) -> Option<CheckOutcome> {
-        self.0.read().unwrap().clone()
+        self.outcome.read().unwrap().clone()
     }
 
     pub fn set(&self, outcome: Option<CheckOutcome>) {
-        *self.0.write().unwrap() = outcome;
+        let version = outcome
+            .as_ref()
+            .and_then(|o| o.update.as_ref())
+            .map(|u| u.version.clone());
+        *self.outcome.write().unwrap() = outcome;
+        self.found.send_if_modified(|found| {
+            let changed = *found != version;
+            *found = version;
+            changed
+        });
+    }
+
+    /// The newest version found now and whenever a check finds a different one.
+    pub fn subscribe_found(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+        self.found.subscribe()
     }
 }
 
@@ -137,6 +164,29 @@ pub(crate) struct GithubReleaseDto {
 mod tests {
     use super::*;
     use crate::api::releases::tests::serve;
+
+    #[test]
+    fn a_new_version_is_announced_once() {
+        let latest = LatestUpdate::default();
+        let mut found = latest.subscribe_found();
+        let outcome = |version: Option<&str>| CheckOutcome {
+            checked_at: komga_core::time_codec::now_utc(),
+            update: version.map(|v| UpdateInfo {
+                version: v.into(),
+                url: String::new(),
+                release_date: komga_core::time_codec::now_utc(),
+            }),
+        };
+        latest.set(Some(outcome(Some("9.9.9"))));
+        assert!(found.has_changed().unwrap());
+        assert_eq!(found.borrow_and_update().as_deref(), Some("9.9.9"));
+        // the daily re-check of the same release stays quiet
+        latest.set(Some(outcome(Some("9.9.9"))));
+        assert!(!found.has_changed().unwrap());
+        latest.set(Some(outcome(None)));
+        assert!(found.has_changed().unwrap());
+        assert_eq!(*found.borrow_and_update(), None);
+    }
 
     fn release(tag: &str, prerelease: bool) -> GithubReleaseDto {
         GithubReleaseDto {

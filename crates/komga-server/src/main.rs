@@ -302,6 +302,13 @@ async fn run() -> anyhow::Result<()> {
         tray::detach_console();
     }
     #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let desktop_update = desktop::update_handle();
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    desktop::follow_update_check(
+        desktop_update.clone(),
+        state.latest_update.subscribe_found(),
+    );
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let tray = tray::start(
         state.config.port,
         tray::TrayPaths {
@@ -309,7 +316,7 @@ async fn run() -> anyhow::Result<()> {
             logs_dir,
         },
         state.shutdown_tx.clone(),
-        desktop::update_handle(),
+        desktop_update,
     );
     // the initial admin claim happens in the web UI; only in an interactive
     // session (tray present) is there a desktop to show it on

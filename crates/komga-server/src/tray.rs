@@ -27,10 +27,14 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MessageBoxW, PeekMessageW, PostThreadMessageW, TranslateMessage,
-    MB_ICONERROR, MB_OK, MSG, PM_NOREMOVE, SW_SHOWNORMAL, WM_QUIT, WM_USER,
+    MB_ICONERROR, MB_OK, MSG, PM_NOREMOVE, SW_SHOWNORMAL, WM_APP, WM_QUIT, WM_USER,
 };
 
 const TRAY_ICON_PNG: &[u8] = include_bytes!("../resources/windows/tray-icon.png");
+
+/// Posted to the tray thread when the update status changes: the icon and the
+/// menu can only be changed from that thread.
+const WM_UPDATE_STATUS: u32 = WM_APP + 1;
 
 const AUTOSTART_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(test)]
@@ -47,6 +51,9 @@ thread_local! {
     static AUTOSTART_ITEM: RefCell<Option<CheckMenuItem>> = const { RefCell::new(None) };
     static UPDATE_ITEM: RefCell<Option<MenuItem>> = const { RefCell::new(None) };
     static TRAY_ICON: RefCell<Option<TrayIcon>> = const { RefCell::new(None) };
+    // the badge the icon currently shows, so it is only swapped on a change
+    static BADGE: std::cell::Cell<crate::desktop::Badge> =
+        const { std::cell::Cell::new(crate::desktop::Badge::None) };
 }
 
 pub struct Tray {
@@ -126,12 +133,23 @@ pub fn start(
         return None;
     }
     let (ready_tx, ready_rx) = mpsc::channel();
+    let mut changes = update.subscribe();
     let handle = std::thread::Builder::new()
         .name("tray".into())
         .spawn(move || run(port, paths, shutdown, update, ready_tx))
         .ok()?;
     match ready_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(thread_id)) => Some(Tray { thread_id, handle }),
+        Ok(Ok(thread_id)) => {
+            // an update the daily check finds shows up without opening the menu
+            tokio::spawn(async move {
+                while changes.changed().await.is_ok() {
+                    unsafe {
+                        PostThreadMessageW(thread_id, WM_UPDATE_STATUS, 0, 0);
+                    }
+                }
+            });
+            Some(Tray { thread_id, handle })
+        }
         Ok(Err(e)) => {
             tracing::warn!("system tray disabled: {e}");
             let _ = handle.join();
@@ -229,6 +247,8 @@ fn run(
 
     TRAY_ICON.with(|slot| *slot.borrow_mut() = Some(tray.clone()));
     migrate_legacy_autostart();
+    let status_update = update.clone();
+    refresh_update_item(&status_update);
 
     let refresh_update = update.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| match event.id.0.as_str() {
@@ -299,6 +319,11 @@ fn run(
         let _ = ready.send(Ok(GetCurrentThreadId()));
 
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            // a thread message has no window to be dispatched to
+            if msg.message == WM_UPDATE_STATUS {
+                refresh_update_item(&status_update);
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -307,9 +332,14 @@ fn run(
 }
 
 fn load_icon() -> Result<Icon, String> {
+    load_icon_image(crate::desktop::Badge::None)
+}
+
+fn load_icon_image(badge: crate::desktop::Badge) -> Result<Icon, String> {
     let image = image::load_from_memory_with_format(TRAY_ICON_PNG, image::ImageFormat::Png)
         .map_err(|e| e.to_string())?
         .into_rgba8();
+    let image = crate::desktop::badged_icon(&image, badge, false);
     let (width, height) = image.dimensions();
     Icon::from_rgba(image.into_raw(), width, height).map_err(|e| e.to_string())
 }
@@ -347,9 +377,19 @@ fn refresh_update_item(update: &crate::service::desktop_update::DesktopUpdate) {
             let status = update.status();
             item.set_text(crate::desktop::status_label(&status));
             item.set_enabled(!crate::desktop::busy(&status));
+            let badge = crate::desktop::update_badge(&status, update.pending());
             TRAY_ICON.with(|slot| {
                 if let Some(icon) = slot.borrow().as_ref() {
                     let _ = icon.set_tooltip(Some(crate::desktop::tooltip(&status)));
+                    if let Some(badge) = badge.filter(|badge| *badge != BADGE.get()) {
+                        match load_icon_image(badge) {
+                            Ok(image) => {
+                                let _ = icon.set_icon(Some(image));
+                                BADGE.set(badge);
+                            }
+                            Err(e) => tracing::warn!("tray icon decode: {e}"),
+                        }
+                    }
                 }
             });
         }
