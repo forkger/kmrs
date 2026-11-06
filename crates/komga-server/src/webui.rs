@@ -115,6 +115,7 @@ mod tests {
             komf_auth_key: None,
             history_retention_days: 180,
             update_check_enabled: true,
+            log_level: None,
             sort_locale: None,
             thumbnail_storage: Default::default(),
             thumbnail_deep_etag: true,

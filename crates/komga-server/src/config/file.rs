@@ -29,6 +29,15 @@ pub struct FileConfig {
     pub history: Option<FileHistory>,
     pub thumbnails: Option<FileThumbnails>,
     pub update_check: Option<FileUpdateCheck>,
+    pub logging: Option<FileLogging>,
+}
+
+/// Log filter for the console and the log files (kmrs enhancement; the Java version sets
+/// levels per logger in application.yml).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct FileLogging {
+    pub level: Option<String>,
 }
 
 /// Daily check for newer kmrs releases on GitHub (kmrs enhancement; the Java version only
@@ -591,6 +600,24 @@ pub fn render(file: &FileConfig, config: &ServerConfig, source: Option<&Path>) -
         format!(
             "enabled = {} # env: KOMGA_UPDATECHECK_ENABLED",
             config.update_check_enabled
+        ),
+    );
+    out.push('\n');
+
+    out.push_str("[logging]\n");
+    out.push_str(
+        "# log filter for the console and the log files, in RUST_LOG syntax (kmrs enhancement;\n\
+         # the Java version sets levels per logger in application.yml)\n",
+    );
+    push_line(
+        &mut out,
+        config.log_level.is_some(),
+        format!(
+            "level = {} # env: RUST_LOG, which wins when set",
+            q(config
+                .log_level
+                .as_deref()
+                .unwrap_or(crate::logging::DEFAULT_FILTER))
         ),
     );
     out.push('\n');

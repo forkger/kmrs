@@ -125,6 +125,10 @@
 # daily check for a newer kmrs release on GitHub, exposed at /api/v1/update-check (kmrs enhancement; the Java version only fetches the release list on demand)
 # enabled = true # env: KOMGA_UPDATECHECK_ENABLED
 
+[logging]
+# log filter for the console and the log files, in RUST_LOG syntax (kmrs enhancement; the Java version sets levels per logger in application.yml)
+# level = "warn,kmrs=info,komga=info" # env: RUST_LOG, which wins when set
+
 [thumbnails]
 # where book/series thumbnail bytes live (kmrs enhancement; Java always uses DB blobs)
 # storage = "db" # db = blobs in the database, file = files under <config-dir>/thumbnails; env: KOMGA_THUMBNAILS_STORAGE

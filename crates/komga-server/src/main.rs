@@ -141,12 +141,13 @@ async fn run() -> anyhow::Result<()> {
     // or process.uptime starts counting from that request.
     service::metrics::process_start();
     let logs_dir = config::config_dir(&cli).join("logs");
-    let _log_guard = logging::init(&logs_dir);
+    let logging = logging::init(&logs_dir);
 
     #[cfg(all(feature = "profiling", unix))]
     profiling::spawn_heap_dump_listener();
 
     let config = config::ServerConfig::load(&cli)?;
+    logging.apply_config_level(config.log_level.as_deref());
     std::fs::create_dir_all(&config.config_dir).context("create config dir")?;
 
     // Sort locale must be set before any collator is constructed (lazily on the

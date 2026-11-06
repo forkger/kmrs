@@ -79,6 +79,9 @@ pub struct ServerConfig {
     pub history_retention_days: u32,
     /// daily GitHub check for a newer release, exposed at /api/v1/update-check (kmrs enhancement)
     pub update_check_enabled: bool,
+    /// log filter from `[logging] level`, in RUST_LOG syntax; RUST_LOG still wins when set
+    /// (kmrs enhancement). None = the built-in default
+    pub log_level: Option<String>,
     /// where book/series thumbnail bytes live (kmrs enhancement; Java always uses DB blobs)
     pub thumbnail_storage: ThumbnailStorage,
     /// answer If-None-Match from the thumbnail row instead of hashing the body
@@ -435,6 +438,16 @@ impl ServerConfig {
                         .and_then(|u| u.enabled)
                 })
                 .unwrap_or(true),
+            log_level: file
+                .and_then(|f| f.logging.as_ref())
+                .and_then(|l| l.level.clone())
+                .filter(|v| !v.trim().is_empty())
+                .map(|level| {
+                    tracing_subscriber::EnvFilter::try_new(&level)
+                        .map(|_| level)
+                        .map_err(|e| anyhow::anyhow!("invalid logging.level: {e}"))
+                })
+                .transpose()?,
             thumbnail_storage: env_string(env, "KOMGA_THUMBNAILS_STORAGE")
                 .or_else(|| {
                     file.and_then(|f| f.thumbnails.as_ref())
@@ -1234,6 +1247,26 @@ issuer-uri = "https://github.com"
         let file: FileConfig = toml::from_str("[thumbnails]\nstorage = \"s3\"\n").unwrap();
         let err = ServerConfig::resolve(Some(&file), &Cli::default(), &[]).unwrap_err();
         assert!(err.to_string().contains("invalid thumbnails.storage"));
+    }
+
+    #[test]
+    fn logging_level_from_file() {
+        assert_eq!(resolve("", Cli::default(), &[]).log_level, None);
+        let config = resolve(
+            "[logging]\nlevel = \"warn,kmrs=debug\"\n",
+            Cli::default(),
+            &[],
+        );
+        assert_eq!(config.log_level.as_deref(), Some("warn,kmrs=debug"));
+        // blank means unset, like the other optional strings
+        assert_eq!(
+            resolve("[logging]\nlevel = \" \"\n", Cli::default(), &[]).log_level,
+            None
+        );
+
+        let file: FileConfig = toml::from_str("[logging]\nlevel = \"kmrs=loud\"\n").unwrap();
+        let err = ServerConfig::resolve(Some(&file), &Cli::default(), &[]).unwrap_err();
+        assert!(err.to_string().contains("invalid logging.level"), "{err}");
     }
 
     #[test]
