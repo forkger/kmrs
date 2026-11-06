@@ -35,6 +35,8 @@ const TRAY_ICON_PNG: &[u8] = include_bytes!("../resources/windows/tray-icon.png"
 /// Posted to the tray thread when the update status changes: the icon and the
 /// menu can only be changed from that thread.
 const WM_UPDATE_STATUS: u32 = WM_APP + 1;
+/// Posted to the tray thread for each frame of the spinner badge.
+const WM_SPINNER_STEP: u32 = WM_APP + 2;
 
 const AUTOSTART_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(test)]
@@ -133,7 +135,7 @@ pub fn start(
         return None;
     }
     let (ready_tx, ready_rx) = mpsc::channel();
-    let mut changes = update.subscribe();
+    let changes = update.subscribe();
     let handle = std::thread::Builder::new()
         .name("tray".into())
         .spawn(move || run(port, paths, shutdown, update, ready_tx))
@@ -141,13 +143,15 @@ pub fn start(
     match ready_rx.recv_timeout(Duration::from_secs(10)) {
         Ok(Ok(thread_id)) => {
             // an update the daily check finds shows up without opening the menu
-            tokio::spawn(async move {
-                while changes.changed().await.is_ok() {
-                    unsafe {
-                        PostThreadMessageW(thread_id, WM_UPDATE_STATUS, 0, 0);
-                    }
-                }
-            });
+            tokio::spawn(crate::desktop::follow_status(
+                changes,
+                move || unsafe {
+                    PostThreadMessageW(thread_id, WM_UPDATE_STATUS, 0, 0);
+                },
+                move || unsafe {
+                    PostThreadMessageW(thread_id, WM_SPINNER_STEP, 0, 0);
+                },
+            ));
             Some(Tray { thread_id, handle })
         }
         Ok(Err(e)) => {
@@ -324,6 +328,10 @@ fn run(
                 refresh_update_item(&status_update);
                 continue;
             }
+            if msg.message == WM_SPINNER_STEP {
+                advance_spinner();
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -377,21 +385,35 @@ fn refresh_update_item(update: &crate::service::desktop_update::DesktopUpdate) {
             let status = update.status();
             item.set_text(crate::desktop::status_label(&status));
             item.set_enabled(!crate::desktop::busy(&status));
-            let badge = crate::desktop::update_badge(&status, update.pending());
             TRAY_ICON.with(|slot| {
                 if let Some(icon) = slot.borrow().as_ref() {
                     let _ = icon.set_tooltip(Some(crate::desktop::tooltip(&status)));
-                    if let Some(badge) = badge.filter(|badge| *badge != BADGE.get()) {
-                        match load_icon_image(badge) {
-                            Ok(image) => {
-                                let _ = icon.set_icon(Some(image));
-                                BADGE.set(badge);
-                            }
-                            Err(e) => tracing::warn!("tray icon decode: {e}"),
-                        }
-                    }
                 }
             });
+            let wanted = crate::desktop::update_badge(&status, update.pending());
+            if let Some(badge) = crate::desktop::badge_change(BADGE.get(), wanted) {
+                show_badge(badge);
+            }
+        }
+    });
+}
+
+fn advance_spinner() {
+    if let Some(badge) = crate::desktop::next_frame(BADGE.get()) {
+        show_badge(badge);
+    }
+}
+
+fn show_badge(badge: crate::desktop::Badge) {
+    TRAY_ICON.with(|slot| {
+        if let Some(icon) = slot.borrow().as_ref() {
+            match load_icon_image(badge) {
+                Ok(image) => {
+                    let _ = icon.set_icon(Some(image));
+                    BADGE.set(badge);
+                }
+                Err(e) => tracing::warn!("tray icon decode: {e}"),
+            }
         }
     });
 }

@@ -325,7 +325,7 @@ pub fn start(
     let (ready_tx, ready_rx) = mpsc::channel();
     let initial = update.clone();
     let follow = update.clone();
-    let mut changes = update.subscribe();
+    let changes = update.subscribe();
     DispatchQueue::main().exec_async(move || {
         let result = build(port, paths, shutdown, update).map(|item| {
             STATUS_ITEM.with(|slot| *slot.borrow_mut() = Some(item));
@@ -336,12 +336,14 @@ pub fn start(
     match ready_rx.recv_timeout(Duration::from_secs(10)) {
         Ok(Ok(())) => {
             // an update the daily check finds shows up without opening the menu
-            tokio::spawn(async move {
-                while changes.changed().await.is_ok() {
+            tokio::spawn(crate::desktop::follow_status(
+                changes,
+                move || {
                     let update = follow.clone();
                     DispatchQueue::main().exec_async(move || refresh_update_item(&update));
-                }
-            });
+                },
+                || DispatchQueue::main().exec_async(advance_spinner),
+            ));
             Some(Tray)
         }
         Ok(Err(e)) => {
@@ -626,21 +628,35 @@ fn refresh_update_item(update: &crate::service::desktop_update::DesktopUpdate) {
             let status = update.status();
             item.set_text(crate::desktop::status_label(&status));
             item.set_enabled(!crate::desktop::busy(&status));
-            let badge = crate::desktop::update_badge(&status, update.pending());
             TRAY_ICON.with(|slot| {
                 if let Some(icon) = slot.borrow().as_ref() {
                     let _ = icon.set_tooltip(Some(crate::desktop::tooltip(&status)));
-                    if let Some(badge) = badge.filter(|badge| *badge != BADGE.get()) {
-                        match load_icon_image(badge) {
-                            Ok(image) => {
-                                let _ = icon.set_icon_templated(Some(image));
-                                BADGE.set(badge);
-                            }
-                            Err(e) => tracing::warn!("menu bar icon decode: {e}"),
-                        }
-                    }
                 }
             });
+            let wanted = crate::desktop::update_badge(&status, update.pending());
+            if let Some(badge) = crate::desktop::badge_change(BADGE.get(), wanted) {
+                show_badge(badge);
+            }
+        }
+    });
+}
+
+fn advance_spinner() {
+    if let Some(badge) = crate::desktop::next_frame(BADGE.get()) {
+        show_badge(badge);
+    }
+}
+
+fn show_badge(badge: crate::desktop::Badge) {
+    TRAY_ICON.with(|slot| {
+        if let Some(icon) = slot.borrow().as_ref() {
+            match load_icon_image(badge) {
+                Ok(image) => {
+                    let _ = icon.set_icon_templated(Some(image));
+                    BADGE.set(badge);
+                }
+                Err(e) => tracing::warn!("menu bar icon decode: {e}"),
+            }
         }
     });
 }

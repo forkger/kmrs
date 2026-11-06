@@ -11,6 +11,10 @@ use crate::service::desktop_update::DesktopUpdate;
 /// failure from a dropped connection clears once the network is back.
 const RETRY_AFTER_FAILURE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// Frames in one turn of the spinner badge and how long each shows: about a turn a second.
+const SPINNER_FRAMES: u8 = 12;
+const SPINNER_STEP: std::time::Duration = std::time::Duration::from_millis(80);
+
 pub fn update_handle() -> DesktopUpdate {
     DesktopUpdate::new(tokio::runtime::Handle::current())
 }
@@ -103,6 +107,61 @@ pub enum Badge {
     Update,
     /// an exclamation mark: an update is known but could not be installed
     Failed,
+    /// the up arrow inside a turning ring, at this frame: an update is downloading or
+    /// installing
+    Updating(u8),
+}
+
+/// The badge to switch to, if any: none while a check keeps the current one, and none
+/// between spinner frames, which advance on their own clock.
+pub fn badge_change(shown: Badge, wanted: Option<Badge>) -> Option<Badge> {
+    match (shown, wanted?) {
+        (Badge::Updating(_), Badge::Updating(_)) => None,
+        (shown, wanted) if shown == wanted => None,
+        (_, wanted) => Some(wanted),
+    }
+}
+
+/// The spinner's next frame while it shows.
+pub fn next_frame(shown: Badge) -> Option<Badge> {
+    match shown {
+        Badge::Updating(frame) => Some(Badge::Updating((frame + 1) % SPINNER_FRAMES)),
+        _ => None,
+    }
+}
+
+/// Runs `refresh` after every status change and, while an update downloads or installs,
+/// `advance` once per spinner frame. Both are expected to hand off to the tray's thread.
+pub async fn follow_status(
+    mut changes: tokio::sync::watch::Receiver<crate::service::desktop_update::Status>,
+    refresh: impl Fn(),
+    advance: impl Fn(),
+) {
+    use crate::service::desktop_update::Status;
+
+    let mut frames = tokio::time::interval(SPINNER_STEP);
+    frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let spinning = matches!(
+            *changes.borrow(),
+            Status::Downloading(_) | Status::Installing(_)
+        );
+        if spinning {
+            tokio::select! {
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    refresh();
+                }
+                _ = frames.tick() => advance(),
+            }
+        } else if changes.changed().await.is_ok() {
+            refresh();
+        } else {
+            return;
+        }
+    }
 }
 
 /// The badge for this status, or `None` while a check runs so that a background retry
@@ -115,7 +174,8 @@ pub fn update_badge(
     use crate::service::desktop_update::Status;
     Some(match status {
         Status::Checking => return None,
-        Status::Available(_) | Status::Downloading(_) | Status::Installing(_) => Badge::Update,
+        Status::Available(_) => Badge::Update,
+        Status::Downloading(_) | Status::Installing(_) => Badge::Updating(0),
         Status::Failed(_) if pending => Badge::Failed,
         Status::Idle | Status::Failed(_) => Badge::None,
     })
@@ -125,7 +185,8 @@ pub fn update_badge(
 /// corner, set off from the logo by a transparent ring, with the logo shrunk toward
 /// the top-left to make room. A macOS template image only keeps its alpha channel, so
 /// there (`template`) the mark is cut out of an opaque circle and the logo is faded to
-/// let the badge stand out; otherwise the badge is drawn in colour.
+/// let the badge stand out; otherwise the badge is drawn in colour. While updating, the
+/// circle gives way to a ring with a gap that turns a step per frame.
 pub fn badged_icon(icon: &image::RgbaImage, badge: Badge, template: bool) -> image::RgbaImage {
     use image::imageops::{resize, FilterType};
 
@@ -150,19 +211,42 @@ pub fn badged_icon(icon: &image::RgbaImage, badge: Badge, template: bool) -> ima
     let gap = size * 4.0 / 64.0;
     let (cx, cy) = (width as f32 - radius, height as f32 - radius);
     let in_circle = |x: f32, y: f32, r: f32| (x - cx).powi(2) + (y - cy).powi(2) <= r * r;
-    // in units of the circle's diameter around its centre, y growing downward
-    let in_mark = |x: f32, y: f32| {
-        let (u, v) = ((x - cx) / diameter, (y - cy) / diameter);
-        if badge == Badge::Failed {
-            // a bar above a dot
-            let bar = u.abs() <= 0.09 && (-0.30..=0.04).contains(&v);
-            let dot = u * u + (v - 0.19).powi(2) <= 0.09 * 0.09;
-            return bar || dot;
-        }
-        // a stem below a triangular head whose tip points up
+    // in units of the circle's diameter around its centre, y growing downward:
+    // a stem below a triangular head whose tip points up
+    let arrow = |u: f32, v: f32| {
         let stem = u.abs() <= 0.09 && (-0.04..=0.27).contains(&v);
         let head = (-0.30..=0.0).contains(&v) && u.abs() <= 0.28 * (v + 0.30) / 0.30;
         stem || head
+    };
+    let in_mark = |x: f32, y: f32| {
+        let (u, v) = ((x - cx) / diameter, (y - cy) / diameter);
+        match badge {
+            // a bar above a dot
+            Badge::Failed => {
+                let bar = u.abs() <= 0.09 && (-0.30..=0.04).contains(&v);
+                let dot = u * u + (v - 0.19).powi(2) <= 0.09 * 0.09;
+                bar || dot
+            }
+            _ => arrow(u, v),
+        }
+    };
+    // three quarters of a ring with round ends, starting further clockwise each frame
+    let in_ring = |x: f32, y: f32| {
+        use std::f32::consts::TAU;
+        let Badge::Updating(frame) = badge else {
+            return false;
+        };
+        let stroke = diameter * 0.08;
+        let middle = radius - stroke / 2.0;
+        let start = TAU * f32::from(frame) / f32::from(SPINNER_FRAMES);
+        let end = start + TAU * 0.75;
+        let (dx, dy) = (x - cx, y - cy);
+        let along = (dy.atan2(dx) - start).rem_euclid(TAU) <= TAU * 0.75;
+        let on_band = (dx.hypot(dy) - middle).abs() <= stroke / 2.0;
+        let cap = |angle: f32| {
+            (dx - middle * angle.cos()).hypot(dy - middle * angle.sin()) <= stroke / 2.0
+        };
+        (on_band && along) || cap(start) || cap(end)
     };
     // share of a pixel inside a shape, sampled on a 4x4 grid for smooth edges
     let coverage = |px: u32, py: u32, inside: &dyn Fn(f32, f32) -> bool| {
@@ -186,17 +270,23 @@ pub fn badged_icon(icon: &image::RgbaImage, badge: Badge, template: bool) -> ima
         if ring == 0.0 {
             continue;
         }
-        let circle = coverage(x, y, &|sx, sy| in_circle(sx, sy, radius));
-        let mark = coverage(x, y, &|sx, sy| in_circle(sx, sy, radius) && in_mark(sx, sy));
         let logo_alpha = f32::from(pixel.0[3]) / 255.0 * (1.0 - ring);
-        let (badge_alpha, badge_rgb) = if template {
-            ((circle - mark).max(0.0), fill)
-        } else if circle > 0.0 {
-            let white = mark / circle;
-            let rgb = [0, 1, 2].map(|c| fill[c] * (1.0 - white) + 255.0 * white);
-            (circle, rgb)
+        let (badge_alpha, badge_rgb) = if matches!(badge, Badge::Updating(_)) {
+            // ring and arrow are drawn solid: there is no circle to cut them out of
+            let shape = coverage(x, y, &|sx, sy| in_ring(sx, sy) || in_mark(sx, sy));
+            (shape, fill)
         } else {
-            (0.0, fill)
+            let circle = coverage(x, y, &|sx, sy| in_circle(sx, sy, radius));
+            let mark = coverage(x, y, &|sx, sy| in_circle(sx, sy, radius) && in_mark(sx, sy));
+            if template {
+                ((circle - mark).max(0.0), fill)
+            } else if circle > 0.0 {
+                let white = mark / circle;
+                let rgb = [0, 1, 2].map(|c| fill[c] * (1.0 - white) + 255.0 * white);
+                (circle, rgb)
+            } else {
+                (0.0, fill)
+            }
         };
         let alpha = badge_alpha + logo_alpha * (1.0 - badge_alpha);
         if alpha > 0.0 {
@@ -396,6 +486,8 @@ mod tests {
             (Badge::Update, false),
             (Badge::Failed, true),
             (Badge::Failed, false),
+            (Badge::Updating(0), true),
+            (Badge::Updating(7), false),
         ] {
             let badged = badged_icon(&image::RgbaImage::new(64, 64), badge, template);
             assert_eq!(badged.dimensions(), (64, 64));
@@ -420,16 +512,54 @@ mod tests {
     }
 
     #[test]
+    fn spinner_turns_and_wraps_around() {
+        let icon = image::RgbaImage::new(64, 64);
+        for template in [true, false] {
+            assert_ne!(
+                badged_icon(&icon, Badge::Updating(0), template),
+                badged_icon(&icon, Badge::Updating(1), template)
+            );
+            assert_ne!(
+                badged_icon(&icon, Badge::Update, template),
+                badged_icon(&icon, Badge::Updating(0), template)
+            );
+        }
+        assert_eq!(next_frame(Badge::Updating(0)), Some(Badge::Updating(1)));
+        assert_eq!(
+            next_frame(Badge::Updating(SPINNER_FRAMES - 1)),
+            Some(Badge::Updating(0))
+        );
+        assert_eq!(next_frame(Badge::Update), None);
+    }
+
+    #[test]
+    fn a_turning_spinner_is_not_restarted() {
+        let spinning = Some(Badge::Updating(0));
+        // a status change from downloading to installing keeps the current frame
+        assert_eq!(badge_change(Badge::Updating(5), spinning), None);
+        assert_eq!(badge_change(Badge::Update, spinning), spinning);
+        assert_eq!(
+            badge_change(Badge::Updating(5), Some(Badge::Failed)),
+            Some(Badge::Failed)
+        );
+        assert_eq!(badge_change(Badge::Update, Some(Badge::Update)), None);
+        assert_eq!(badge_change(Badge::Failed, None), None);
+    }
+
+    #[test]
     fn badge_follows_the_update_status() {
         use crate::service::desktop_update::Status;
+        assert_eq!(
+            update_badge(&Status::Available("1.2.3".into()), true),
+            Some(Badge::Update)
+        );
         for status in [
-            Status::Available("1.2.3".into()),
             Status::Downloading("1.2.3".into()),
             Status::Installing("1.2.3".into()),
         ] {
             assert_eq!(
                 update_badge(&status, true),
-                Some(Badge::Update),
+                Some(Badge::Updating(0)),
                 "{status:?}"
             );
         }
