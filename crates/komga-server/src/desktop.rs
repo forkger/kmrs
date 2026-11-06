@@ -19,23 +19,47 @@ pub fn update_handle() -> DesktopUpdate {
     DesktopUpdate::new(tokio::runtime::Handle::current())
 }
 
+/// The Windows menu's update entry. A failure offers a retry only while a newer release
+/// is known (`pending`); a check that failed with nothing to install offers a new check.
 #[cfg(target_os = "windows")]
-pub fn status_label(status: &crate::service::desktop_update::Status) -> String {
+pub fn status_label(status: &crate::service::desktop_update::Status, pending: bool) -> String {
     use crate::service::desktop_update::Status;
     match status {
-        Status::Idle => "Check for Updates".into(),
         Status::Checking => "Checking for Updates…".into(),
         Status::Available(version) => format!("Update to {version} and Restart"),
         Status::Downloading(version) => format!("Downloading {version}…"),
         Status::Installing(version) => format!("Installing {version}…"),
-        Status::Failed(_) => "Retry Update".into(),
+        Status::Failed(_) if pending => "Retry Update".into(),
+        Status::Idle | Status::Failed(_) => "Check for Updates".into(),
     }
 }
 
-pub fn tooltip(status: &crate::service::desktop_update::Status) -> String {
+/// The tray icon's hover text, or `None` while a check runs so that a background retry
+/// keeps the failure reason next to the "!" badge.
+pub fn tooltip(status: &crate::service::desktop_update::Status) -> Option<String> {
+    use crate::service::desktop_update::Status;
     match status {
-        crate::service::desktop_update::Status::Failed(error) => format!("Update failed: {error}"),
-        _ => "KMServer".into(),
+        Status::Checking => None,
+        Status::Failed(error) => Some(format!("Update failed: {error}")),
+        _ => Some("KMServer".into()),
+    }
+}
+
+/// Handles a click on the update entry while nothing is under way, and returns whether to
+/// go on and install. A checked update installs; a failed one for a known release is
+/// checked again and installs if the check finds it, so a retry takes one click. Anything
+/// else starts a check. Blocks during the retry's check, so call it off the tray's thread.
+pub fn click_installs(update: &DesktopUpdate) -> bool {
+    use crate::service::desktop_update::Status;
+    match update.status() {
+        Status::Available(_) => true,
+        Status::Failed(_) if update.pending() => {
+            update.check_blocking().is_ok() && matches!(update.status(), Status::Available(_))
+        }
+        _ => {
+            let _ = update.start_check();
+            false
+        }
     }
 }
 
@@ -625,20 +649,33 @@ mod tests {
     fn status_is_actionable_without_hiding_progress() {
         #[cfg(target_os = "windows")]
         {
+            use crate::service::desktop_update::Status;
+            assert_eq!(status_label(&Status::Idle, false), "Check for Updates");
+            assert!(status_label(&Status::Available("1.2.3".into()), true).contains("1.2.3"));
             assert_eq!(
-                status_label(&crate::service::desktop_update::Status::Idle),
-                "Check for Updates"
+                status_label(&Status::Failed("x".into()), true),
+                "Retry Update"
             );
-            assert!(
-                status_label(&crate::service::desktop_update::Status::Available(
-                    "1.2.3".into()
-                ))
-                .contains("1.2.3")
+            // a failed check with no known release has nothing to retry
+            assert_eq!(
+                status_label(&Status::Failed("x".into()), false),
+                "Check for Updates"
             );
         }
         assert!(busy(&crate::service::desktop_update::Status::Installing(
             "1.2.3".into()
         )));
+    }
+
+    #[test]
+    fn hover_text_keeps_the_failure_reason_while_checking_again() {
+        use crate::service::desktop_update::Status;
+        assert_eq!(
+            tooltip(&Status::Failed("offline".into())).as_deref(),
+            Some("Update failed: offline")
+        );
+        assert_eq!(tooltip(&Status::Checking), None);
+        assert_eq!(tooltip(&Status::Idle).as_deref(), Some("KMServer"));
     }
 
     #[cfg(target_os = "macos")]

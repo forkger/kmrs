@@ -495,8 +495,8 @@ fn build(
                 let app = crate::desktop::app_bundle_path().unwrap();
                 let config_dir = config_dir.clone();
                 let login_service = login_item_service(&config_dir);
-                std::thread::spawn(move || match update.status() {
-                    crate::service::desktop_update::Status::Available(_) => {
+                std::thread::spawn(move || {
+                    if crate::desktop::click_installs(&update) {
                         crate::desktop::start_update(
                             update,
                             app,
@@ -505,9 +505,6 @@ fn build(
                             login_service,
                             shutdown,
                         )
-                    }
-                    _ => {
-                        let _ = update.start_check();
                     }
                 });
             }
@@ -631,7 +628,9 @@ fn refresh_update_item(update: &crate::service::desktop_update::DesktopUpdate) {
             item.set_enabled(line.enabled);
             TRAY_ICON.with(|slot| {
                 if let Some(icon) = slot.borrow().as_ref() {
-                    let _ = icon.set_tooltip(Some(crate::desktop::tooltip(&status)));
+                    if let Some(text) = crate::desktop::tooltip(&status) {
+                        let _ = icon.set_tooltip(Some(text));
+                    }
                 }
             });
             let wanted = crate::desktop::update_badge(&status, update.pending());

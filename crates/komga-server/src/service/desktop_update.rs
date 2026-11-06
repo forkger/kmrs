@@ -62,6 +62,24 @@ impl DesktopUpdate {
     }
 
     pub fn start_check(&self) -> Result<(), String> {
+        self.begin_check()?;
+        let this = self.clone();
+        self.runtime.spawn(async move {
+            if let Err(e) = check(&this).await {
+                tracing::warn!("update check failed: {e}");
+            }
+        });
+        Ok(())
+    }
+
+    /// Checks and waits for the result, for a retry that goes on to install. Call it off
+    /// the runtime's threads, like `download_verified`.
+    pub fn check_blocking(&self) -> Result<(), String> {
+        self.begin_check()?;
+        self.runtime.block_on(check(self)).map(|_| ())
+    }
+
+    fn begin_check(&self) -> Result<(), String> {
         {
             let mut state = self.state.lock().unwrap();
             if !matches!(
@@ -73,12 +91,6 @@ impl DesktopUpdate {
             state.status = Status::Checking;
         }
         self.publish(&Status::Checking);
-        let this = self.clone();
-        self.runtime.spawn(async move {
-            if let Err(e) = check(&this).await {
-                tracing::warn!("update check failed: {e}");
-            }
-        });
         Ok(())
     }
 

@@ -201,7 +201,7 @@ fn run(
     let update_item = installed_exe.as_ref().map(|_| {
         MenuItem::with_id(
             "update",
-            crate::desktop::status_label(&update.status()),
+            crate::desktop::status_label(&update.status(), update.pending()),
             true,
             None,
         )
@@ -285,12 +285,9 @@ fn run(
                 let shutdown = shutdown.clone();
                 let app = installed_exe.clone().unwrap();
                 let config_dir = update_config_dir.clone();
-                std::thread::spawn(move || match update.status() {
-                    crate::service::desktop_update::Status::Available(_) => {
+                std::thread::spawn(move || {
+                    if crate::desktop::click_installs(&update) {
                         crate::desktop::start_update(update, app, config_dir, shutdown)
-                    }
-                    _ => {
-                        let _ = update.start_check();
                     }
                 });
             }
@@ -383,11 +380,13 @@ fn refresh_update_item(update: &crate::service::desktop_update::DesktopUpdate) {
     UPDATE_ITEM.with(|slot| {
         if let Some(item) = slot.borrow().as_ref() {
             let status = update.status();
-            item.set_text(crate::desktop::status_label(&status));
+            item.set_text(crate::desktop::status_label(&status, update.pending()));
             item.set_enabled(!crate::desktop::busy(&status));
             TRAY_ICON.with(|slot| {
                 if let Some(icon) = slot.borrow().as_ref() {
-                    let _ = icon.set_tooltip(Some(crate::desktop::tooltip(&status)));
+                    if let Some(text) = crate::desktop::tooltip(&status) {
+                        let _ = icon.set_tooltip(Some(text));
+                    }
                 }
             });
             let wanted = crate::desktop::update_badge(&status, update.pending());
