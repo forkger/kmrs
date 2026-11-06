@@ -393,7 +393,7 @@ fn build(
     let update_item = crate::desktop::app_bundle_path().map(|_| {
         MenuItem::with_id(
             "update",
-            crate::desktop::status_label(&update.status()),
+            crate::desktop::update_line(&update.status(), None).title,
             true,
             None,
         )
@@ -626,8 +626,9 @@ fn refresh_update_item(update: &crate::service::desktop_update::DesktopUpdate) {
     UPDATE_ITEM.with(|slot| {
         if let Some(item) = slot.borrow().as_ref() {
             let status = update.status();
-            item.set_text(crate::desktop::status_label(&status));
-            item.set_enabled(!crate::desktop::busy(&status));
+            let line = crate::desktop::update_line(&status, update.known_version().as_deref());
+            set_update_line(item, &line);
+            item.set_enabled(line.enabled);
             TRAY_ICON.with(|slot| {
                 if let Some(icon) = slot.borrow().as_ref() {
                     let _ = icon.set_tooltip(Some(crate::desktop::tooltip(&status)));
@@ -639,6 +640,41 @@ fn refresh_update_item(update: &crate::service::desktop_update::DesktopUpdate) {
             }
         }
     });
+}
+
+/// Shows the update entry, with its hint on a second line in smaller grey type.
+fn set_update_line(item: &MenuItem, line: &crate::desktop::UpdateLine) {
+    use objc2::AllocAnyThread;
+    let Some(hint) = line.hint else {
+        item.set_text(&line.title);
+        return;
+    };
+    let text = format!("{}\n{hint}", line.title);
+    let title = NSMutableAttributedString::initWithString(
+        NSMutableAttributedString::alloc(),
+        &NSString::from_str(&text),
+    );
+    // NSRange counts UTF-16 units
+    let units = |part: &str| part.encode_utf16().count();
+    let hint_range = NSRange::new(units(&text) - units(hint), units(hint));
+    unsafe {
+        title.addAttribute_value_range(
+            NSFontAttributeName,
+            &NSFont::menuFontOfSize(0.0),
+            NSRange::new(0, units(&text)),
+        );
+        title.addAttribute_value_range(
+            NSFontAttributeName,
+            &NSFont::menuFontOfSize(NSFont::smallSystemFontSize()),
+            hint_range,
+        );
+        title.addAttribute_value_range(
+            NSForegroundColorAttributeName,
+            &NSColor::secondaryLabelColor(),
+            hint_range,
+        );
+    }
+    item.set_attributed_title(Some(&title));
 }
 
 fn advance_spinner() {

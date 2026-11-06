@@ -35,7 +35,8 @@ pub struct DesktopUpdate {
 struct State {
     status: Status,
     selected: Option<Asset>,
-    announced: bool,
+    // the newer release the daily update check found
+    announced: Option<String>,
 }
 
 impl DesktopUpdate {
@@ -86,19 +87,26 @@ impl DesktopUpdate {
         self.publish(&status);
     }
 
-    /// Records whether the daily update check knows of a newer release, which a failed
+    /// Records the newer release the daily update check found, if any, which a failed
     /// desktop check (such as a release without checksums) cannot tell on its own.
-    pub fn announce(&self, found: bool) {
+    pub fn announce(&self, version: Option<String>) {
         let mut state = self.state.lock().unwrap();
-        state.announced = found;
-        // the badge depends on it, so the tray refreshes even when the status stays
+        state.announced = version;
+        // the badge and the menu depend on it, so the tray refreshes even when the
+        // status stays
         self.changed.send_replace(state.status.clone());
     }
 
     /// Whether a newer release is known, from either check.
     pub fn pending(&self) -> bool {
+        self.known_version().is_some()
+    }
+
+    /// The newer release known from either check; the desktop check's pick wins.
+    pub fn known_version(&self) -> Option<String> {
         let state = self.state.lock().unwrap();
-        state.announced || state.selected.is_some()
+        let selected = state.selected.as_ref().map(|asset| asset.version.clone());
+        selected.or_else(|| state.announced.clone())
     }
 
     pub fn set_failed(&self, error: String) {
@@ -326,10 +334,11 @@ mod tests {
         update.set_failed("offline".into());
         assert!(!update.pending());
         changes.borrow_and_update();
-        update.announce(true);
+        update.announce(Some("99.0.0".into()));
         assert!(changes.has_changed().unwrap());
         assert!(update.pending());
-        update.announce(false);
+        assert_eq!(update.known_version().as_deref(), Some("99.0.0"));
+        update.announce(None);
         assert!(!update.pending());
     }
 

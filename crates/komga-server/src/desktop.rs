@@ -19,6 +19,7 @@ pub fn update_handle() -> DesktopUpdate {
     DesktopUpdate::new(tokio::runtime::Handle::current())
 }
 
+#[cfg(target_os = "windows")]
 pub fn status_label(status: &crate::service::desktop_update::Status) -> String {
     use crate::service::desktop_update::Status;
     match status {
@@ -73,9 +74,10 @@ pub fn follow_update_check(
     tokio::spawn(async move {
         let mut retry = tokio::time::interval(RETRY_AFTER_FAILURE);
         loop {
-            let found_now = found.borrow_and_update().is_some();
+            let found_now = found.borrow_and_update().clone();
+            let newer = found_now.is_some();
             update.announce(found_now);
-            if found_now {
+            if newer {
                 // refused while a check or an update is already running
                 let _ = update.start_check();
             }
@@ -96,6 +98,48 @@ pub fn follow_update_check(
             }
         }
     });
+}
+
+/// The update entry in the macOS menu: a main line, an optional hint under it in smaller
+/// grey type, and whether clicking it does anything.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+pub struct UpdateLine {
+    pub title: String,
+    pub hint: Option<&'static str>,
+    pub enabled: bool,
+}
+
+/// The macOS menu's update entry for this status. Unless an update is under way or known,
+/// it stays the on-demand "Check for Updates".
+#[cfg(target_os = "macos")]
+pub fn update_line(
+    status: &crate::service::desktop_update::Status,
+    known_version: Option<&str>,
+) -> UpdateLine {
+    use crate::service::desktop_update::Status;
+    let line = |title: String, hint, enabled| UpdateLine {
+        title,
+        hint,
+        enabled,
+    };
+    match (status, known_version) {
+        (Status::Checking, _) => line("Checking for Updates…".into(), None, false),
+        (Status::Available(version), _) => line(
+            format!("Version {version} available"),
+            Some("Click to update and restart"),
+            true,
+        ),
+        (Status::Downloading(version) | Status::Installing(version), _) => {
+            line(format!("Updating to {version}…"), None, false)
+        }
+        (Status::Failed(_), Some(version)) => line(
+            format!("Version {version} available"),
+            Some("Update failed. Click to try again"),
+            true,
+        ),
+        (Status::Idle | Status::Failed(_), _) => line("Check for Updates".into(), None, true),
+    }
 }
 
 /// The mark on the tray icon.
@@ -579,19 +623,71 @@ mod tests {
 
     #[test]
     fn status_is_actionable_without_hiding_progress() {
-        assert_eq!(
-            status_label(&crate::service::desktop_update::Status::Idle),
-            "Check for Updates"
-        );
-        assert!(
-            status_label(&crate::service::desktop_update::Status::Available(
-                "1.2.3".into()
-            ))
-            .contains("1.2.3")
-        );
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                status_label(&crate::service::desktop_update::Status::Idle),
+                "Check for Updates"
+            );
+            assert!(
+                status_label(&crate::service::desktop_update::Status::Available(
+                    "1.2.3".into()
+                ))
+                .contains("1.2.3")
+            );
+        }
         assert!(busy(&crate::service::desktop_update::Status::Installing(
             "1.2.3".into()
         )));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn menu_keeps_the_on_demand_check_unless_an_update_is_known() {
+        use crate::service::desktop_update::Status;
+        let plain = |title: &str, enabled| UpdateLine {
+            title: title.into(),
+            hint: None,
+            enabled,
+        };
+        assert_eq!(
+            update_line(&Status::Idle, None),
+            plain("Check for Updates", true)
+        );
+        assert_eq!(
+            update_line(&Status::Checking, None),
+            plain("Checking for Updates…", false)
+        );
+        assert_eq!(
+            update_line(&Status::Available("1.2.3".into()), Some("1.2.3")),
+            UpdateLine {
+                title: "Version 1.2.3 available".into(),
+                hint: Some("Click to update and restart"),
+                enabled: true,
+            }
+        );
+        for status in [
+            Status::Downloading("1.2.3".into()),
+            Status::Installing("1.2.3".into()),
+        ] {
+            assert_eq!(
+                update_line(&status, Some("1.2.3")),
+                plain("Updating to 1.2.3…", false)
+            );
+        }
+        assert_eq!(
+            update_line(&Status::Failed("x".into()), Some("1.2.3")),
+            UpdateLine {
+                title: "Version 1.2.3 available".into(),
+                hint: Some("Update failed. Click to try again"),
+                enabled: true,
+            }
+        );
+        // a failed check with no known release does not claim one
+        assert_eq!(
+            update_line(&Status::Failed("x".into()), None),
+            plain("Check for Updates", true)
+        );
     }
 
     #[cfg(target_os = "macos")]
