@@ -109,7 +109,6 @@
     "original": "原始尺寸"
   },
   "pageTransition": {
-    "auto": "自动",
     "slide": "滑动",
     "fade": "淡入淡出"
   },

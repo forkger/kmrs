@@ -7,7 +7,7 @@ import type { PagedReaderLayout } from '@/lib/utils/spreads'
 
 export type ScaleType = 'SCREEN' | 'WIDTH' | 'WIDTH_SHRINK_ONLY' | 'HEIGHT' | 'ORIGINAL'
 export type ContinuousScaleType = 'WIDTH' | 'ORIGINAL'
-export type PageTransition = 'AUTO' | 'SLIDE' | 'FADE'
+export type PageTransition = 'SLIDE' | 'FADE'
 export type ReaderBackground = 'BLACK' | 'GRAY' | 'WHITE' | 'AUTO'
 export type ResolvedReaderBackground = Exclude<ReaderBackground, 'AUTO'>
 export type TapZoneLayout = 'STANDARD' | 'REVERSED' | 'EDGE' | 'KINDLE' | 'OFF'
@@ -30,7 +30,7 @@ export interface ReaderSettings {
   swipe: boolean
   tapZones: TapZoneLayout
   animations: boolean
-  /** paged reader turn style while animations are on; AUTO fades horizontal turns in landscape viewports */
+  /** paged reader turn style while animations are on */
   pageTransition: PageTransition
   alwaysFullscreen: boolean
   background: ReaderBackground
@@ -67,7 +67,7 @@ export const useReaderSettings = create<ReaderSettingsState>()(
       swipe: true,
       tapZones: 'STANDARD',
       animations: true,
-      pageTransition: 'AUTO',
+      pageTransition: 'SLIDE',
       alwaysFullscreen: false,
       background: 'BLACK',
       epubTheme: 'DAY',
@@ -77,7 +77,16 @@ export const useReaderSettings = create<ReaderSettingsState>()(
       epubLineHeight: null,
       update: (patch) => set(patch),
     }),
-    { name: 'kmweb.reader' },
+    {
+      name: 'kmweb.reader',
+      // the turn style is an explicit choice now; a stored AUTO (the old landscape crossfade
+      // preset) has no segment left to select, so it lands on the default slide
+      version: 1,
+      migrate: (persisted) => {
+        const state = (persisted ?? {}) as Partial<ReaderSettingsState> & { pageTransition?: string }
+        return { ...state, pageTransition: state.pageTransition === 'FADE' ? 'FADE' : 'SLIDE' } as ReaderSettingsState
+      },
+    },
   ),
 )
 

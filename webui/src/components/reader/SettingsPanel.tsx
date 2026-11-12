@@ -160,9 +160,8 @@ const PAGED_SCALE_VALUES: ScaleType[] = ['SCREEN', 'WIDTH', 'WIDTH_SHRINK_ONLY',
 const CONTINUOUS_SCALE_VALUES: ContinuousScaleType[] = ['WIDTH', 'ORIGINAL']
 const LAYOUT_VALUES: PagedReaderLayout[] = ['SINGLE_PAGE', 'DOUBLE_PAGES', 'DOUBLE_NO_COVER']
 const BACKGROUND_VALUES: ReaderBackground[] = ['AUTO', 'BLACK', 'GRAY', 'WHITE']
-const PAGE_TRANSITION_VALUES: PageTransition[] = ['AUTO', 'SLIDE', 'FADE']
+const PAGE_TRANSITION_VALUES: PageTransition[] = ['SLIDE', 'FADE']
 const PAGE_TRANSITION_LABEL_KEYS: Record<PageTransition, string> = {
-  AUTO: 'pageTransition.auto',
   SLIDE: 'pageTransition.slide',
   FADE: 'pageTransition.fade',
 }

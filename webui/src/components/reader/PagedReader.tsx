@@ -5,7 +5,6 @@ import {
   useMemo,
   useRef,
   useState,
-  useSyncExternalStore,
   type CSSProperties,
 } from 'react'
 import { useReducedMotion } from 'motion/react'
@@ -19,7 +18,7 @@ import { BookTransition } from './BookTransition'
 import { useWindowKeys } from './keys'
 import { PageImage } from './PageImage'
 import { tapAction } from './tapZones'
-import { useDragTurn } from './useDragTurn'
+import { useDragTurn, type DragFade, type DragFadeDir } from './useDragTurn'
 import { usePinchZoom } from './usePinchZoom'
 
 interface PagedReaderProps {
@@ -101,18 +100,16 @@ function splitBoxStyle(scale: ScaleType, width: number, height: number): CSSProp
 }
 
 /** How long a turn keeps the old page up while the target loads; past this the spinner is the better answer */
-const TURN_HOLD_MS = 500
+const TURN_HOLD_MS = 250
 
-const landscapeViewport = window.matchMedia('(orientation: landscape)')
-
-function useLandscapeViewport(): boolean {
-  return useSyncExternalStore(
-    (onChange) => {
-      landscapeViewport.addEventListener('change', onChange)
-      return () => landscapeViewport.removeEventListener('change', onChange)
-    },
-    () => landscapeViewport.matches,
-  )
+/**
+ * The crossfade layer a drag drives: the outgoing spread reads its opacity from the variable the
+ * gesture writes per frame, and eases back when the pull is abandoned.
+ */
+function fadeLayerStyle(fade: DragFade): CSSProperties {
+  return fade.phase === 'drag'
+    ? { opacity: 'calc(1 - var(--paged-fade, 0))', transition: 'none' }
+    : { opacity: 1, transition: 'opacity 160ms ease-out' }
 }
 
 export function PagedReader({
@@ -181,16 +178,38 @@ export function PagedReader({
     return () => window.clearTimeout(timer)
   }, [shownIndex, spreadIndex, spreads])
   const animate = animations && !reduceMotion
-  const landscape = useLandscapeViewport()
   // a page narrower than the viewport leaves a gap that a slide sweeps through the reading
   // area as a dark flash on every turn. Split pages keep sliding: leaving the current spread
   // drops the crop, which a fade would show in place
-  const crossfade =
-    animate && !splitOn && (pageTransition === 'FADE' || (pageTransition === 'AUTO' && landscape && !vertical))
+  const crossfade = animate && !splitOn && pageTransition === 'FADE'
   // fit modes stay inside the viewport; the rest need a scrollable slide
   const scrollable = scale === 'WIDTH' || scale === 'WIDTH_SHRINK_ONLY' || scale === 'ORIGINAL'
   // hugging the content keeps horizontal overflow reachable by scroll while small content stays centered
   const hugContent = scale === 'ORIGINAL' || scale === 'HEIGHT'
+
+  // the fade layer is the outgoing/target pair of a crossfade drag, held in React only so the
+  // two spreads swap stacking roles; its progress reaches the DOM through a variable instead.
+  // It is re-checked on render rather than dropped in an effect: a landing, or a layout change
+  // it cannot outlive, simply stops matching the slot and mode it was made for
+  const [fadePair, setFadePair] = useState<{ layer: DragFade; key: string } | null>(null)
+  const resting = transition === 'next' ? spreads.length : transition === 'previous' ? -1 : shownIndex
+  const fadeKey = `${pageLayout}|${direction}|${splitOn}|${splitHalf}|${crossfade}|${book.id}|${transition ?? ''}`
+  const fade =
+    fadePair !== null && fadePair.key === fadeKey && fadePair.layer.base === resting ? fadePair.layer : null
+  const fadeIn = fade === null ? -2 : fade.base + (fade.dir === 'next' ? 1 : -1)
+  const onFade = useCallback(
+    (layer: DragFade | null) => setFadePair(layer === null ? null : { layer, key: fadeKey }),
+    [fadeKey],
+  )
+  const canPaint = useCallback(
+    (dir: DragFadeDir) => {
+      const i = resting + (dir === 'next' ? 1 : -1)
+      // a transition page is not a spread: there is no image to wait for
+      if (i < 0 || i >= spreads.length) return true
+      return spreads[i].every((p) => p.blank || readyPages.has(p.url))
+    },
+    [resting, spreads, readyPages],
+  )
 
   const {
     targetRef,
@@ -302,15 +321,19 @@ export function PagedReader({
   const swipedRef = useRef(false)
   const trackRef = useRef<HTMLDivElement>(null)
   // the drag follows the finger only where the turn axis does not scroll natively (fit modes)
-  // and the track actually slides; elsewhere the swipe keeps its release-only thresholds
+  // and the track actually slides; elsewhere the swipe keeps its release-only thresholds, and a
+  // crossfade at least fades the old page away under it
   const followDrag = !crossfade && (vertical ? !scrollable : !hugContent)
   const drag = useDragTurn({
     track: () => trackRef.current,
     vertical,
     flip,
     follow: followDrag,
+    fade: crossfade,
+    canPaint,
+    onFade,
     animate,
-    resting: transition === 'next' ? spreads.length : transition === 'previous' ? -1 : shownIndex,
+    resting,
     spreadCount: spreads.length,
     followForward: !(curSplittable && splitHalf === 0),
     followBackward: !(curSplittable && splitHalf === 1),
@@ -397,7 +420,7 @@ export function PagedReader({
             'relative h-full w-full',
             !crossfade && 'flex',
             !crossfade && (vertical ? 'flex-col' : flip && 'flex-row-reverse'),
-            !crossfade && animate && 'transition-transform duration-300 ease-[cubic-bezier(.25,.8,.5,1)]',
+            !crossfade && animate && 'transition-transform duration-200 ease-[cubic-bezier(.25,.8,.5,1)]',
             // a drag writes the transform per frame; the transition would lag it behind the finger
             '[&.dragging]:transition-none',
           )}
@@ -406,17 +429,25 @@ export function PagedReader({
           {spreads.map((spread, i) => {
             const double = spread.length > 1
             const near = Math.abs(i - spreadIndex) <= 2 || i === shownIndex
+            const fadingOut = fade !== null && fade.base === i
+            const fadingIn = fade !== null && fadeIn === i
+            const fadeStyle = fade !== null && fadingOut ? fadeLayerStyle(fade) : undefined
             return (
               <div
                 key={i}
+                data-reader-scroll=""
                 className={cn(
                   'flex h-full w-full overflow-auto no-scrollbar',
                   !crossfade && 'shrink-0',
+                  crossfade && 'absolute inset-0',
+                  // the drag draws its own pair: the target underneath, the outgoing on top
+                  fadingOut && 'pointer-events-none z-10',
+                  fadingIn && 'pointer-events-none z-0',
                   // the new page is opaque at once under the fading old one, so the
                   // reader background never shows through mid-turn
-                  crossfade && 'absolute inset-0',
-                  crossfade && (transition !== null || i !== shownIndex) && hiddenSlide,
+                  crossfade && !fadingOut && !fadingIn && (transition !== null || i !== shownIndex) && hiddenSlide,
                 )}
+                style={fadeStyle}
               >
                 <div
                   className={cn(
@@ -480,13 +511,22 @@ export function PagedReader({
               </div>
             )
           })}
-          {(['previous', 'next'] as const).map(
-            (dir) =>
+          {(['previous', 'next'] as const).map((dir) => {
+            const slot = transitionSlot(dir)
+            const fadingOut = fade !== null && fade.base === slot
+            const fadingIn = fade !== null && fadeIn === slot
+            const fadeStyle = fade !== null && fadingOut ? fadeLayerStyle(fade) : undefined
+            return (
               (dir === 'next' ? atLast : atFirst) && (
                 <div
                   key={dir}
-                  className={cn('absolute inset-0', crossfade && transition !== dir && hiddenSlide)}
-                  style={crossfade ? undefined : { transform: offset(transitionSlot(dir)) }}
+                  className={cn(
+                    'absolute inset-0',
+                    fadingOut && 'pointer-events-none z-10',
+                    fadingIn && 'pointer-events-none z-0',
+                    crossfade && !fadingOut && !fadingIn && transition !== dir && hiddenSlide,
+                  )}
+                  style={crossfade ? fadeStyle : { transform: offset(slot) }}
                 >
                   <BookTransition
                     direction={dir}
@@ -496,8 +536,9 @@ export function PagedReader({
                     onLeave={() => onLeaveBook(dir)}
                   />
                 </div>
-              ),
-          )}
+              )
+            )
+          })}
         </div>
       </div>
     </div>
