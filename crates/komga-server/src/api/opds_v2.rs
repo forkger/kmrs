@@ -607,7 +607,9 @@ fn map_media_error(error: komga_media::MediaError) -> ApiError {
         }
         komga_media::MediaError::Unsupported { message, .. } => ApiError::Internal(message),
         komga_media::MediaError::EntryNotFound(message) => ApiError::Internal(message),
-        komga_media::MediaError::Other(error) => ApiError::Internal(error.to_string()),
+        error @ (komga_media::MediaError::Other(_) | komga_media::MediaError::NoThumbnail) => {
+            ApiError::Internal(error.to_string())
+        }
     }
 }
 

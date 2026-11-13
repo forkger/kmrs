@@ -25,6 +25,9 @@ pub enum MediaError {
     #[error("{0}")]
     Conversion(String),
 
+    #[error("no thumbnail could be found")]
+    NoThumbnail,
+
     #[error("file not found: {0}")]
     NoSuchFile(String),
 

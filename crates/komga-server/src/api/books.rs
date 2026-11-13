@@ -54,6 +54,7 @@ const MEDIATYPE_PROGRESSION_JSON: &str = "application/vnd.readium.progression+js
 const MEDIATYPE_POSITION_LIST_JSON: &str = "application/vnd.readium.position-list+json";
 
 const CSP_HEADER: &str = "script-src 'none'; object-src 'none';";
+const PAGE_CSP_HEADER: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -977,7 +978,9 @@ fn map_media_error(error: MediaError) -> ApiError {
         // MediaUnsupportedException is uncaught by getBookPageInternal → 500
         MediaError::Unsupported { message, .. } => ApiError::Internal(message),
         MediaError::EntryNotFound(message) => ApiError::Internal(message),
-        MediaError::Other(error) => ApiError::Internal(error.to_string()),
+        error @ (MediaError::Other(_) | MediaError::NoThumbnail) => {
+            ApiError::Internal(error.to_string())
+        }
     }
 }
 
@@ -1097,6 +1100,10 @@ fn raw_page_response(
         axum::http::header::CONTENT_TYPE,
         content_type_header(Some(&page_content.media_type)),
     );
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(PAGE_CSP_HEADER),
+    );
     set_last_modified(&mut response, media);
     response
 }
@@ -1113,6 +1120,10 @@ fn image_page_response(
     let mut response = Response::new(Body::from(page_content.bytes));
     let headers = response.headers_mut();
     if with_disposition {
+        headers.insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(PAGE_CSP_HEADER),
+        );
         headers.insert(
             axum::http::header::CONTENT_DISPOSITION,
             HeaderValue::from_str(&content_disposition(
@@ -3260,6 +3271,12 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers["content-type"], "image/png");
+        assert_eq!(
+            headers
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("default-src 'none'; style-src 'unsafe-inline'; sandbox")
+        );
         assert_eq!(&body[0..4], b"\x89PNG");
         let disposition = headers["content-disposition"].to_str().unwrap().to_string();
         assert!(
@@ -3278,6 +3295,7 @@ mod tests {
         let request = builder.body(Body::empty()).unwrap();
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(!response.headers().contains_key("content-security-policy"));
 
         // zero_based: page 0 == page 1
         let (status, _, _) = call(
@@ -3331,7 +3349,49 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers["content-type"], "image/jpeg");
+        assert_eq!(
+            headers
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("default-src 'none'; style-src 'unsafe-inline'; sandbox")
+        );
         assert_eq!(&body[0..3], b"\xFF\xD8\xFF");
+    }
+
+    #[test]
+    fn book_page_raw_response_has_csp() {
+        let state = test_state_with_settings();
+        let db = state.db.clone();
+        seed_library(&db, "l1");
+        seed_series(&db, "s1", "l1");
+        seed_book(&db, "b1", "s1", "l1", "file:/data/b1.pdf");
+        seed_media(
+            &db,
+            "b1",
+            MediaStatus::Ready,
+            detect::APPLICATION_PDF,
+            zip_pages(),
+        );
+        let book = book_dao(&state).find_by_id("b1").unwrap().unwrap();
+        let media = require_media(&state, "b1").unwrap();
+        let response = raw_page_response(
+            &book,
+            &media,
+            1,
+            container::PageContent {
+                bytes: b"%PDF-1.7".to_vec(),
+                media_type: detect::APPLICATION_PDF.to_string(),
+            },
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/pdf");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("default-src 'none'; style-src 'unsafe-inline'; sandbox")
+        );
     }
 
     #[tokio::test]
@@ -3390,6 +3450,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers["content-type"], "image/jpeg");
         assert_eq!(&body[0..3], b"\xFF\xD8\xFF");
+        assert!(!headers.contains_key("content-security-policy"));
     }
 
     #[tokio::test]

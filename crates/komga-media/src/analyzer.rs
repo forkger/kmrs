@@ -448,7 +448,7 @@ impl Analyzer {
         }
         let poster = self
             .get_poster(book_path, media)
-            .ok_or_else(|| MediaError::Conversion("no thumbnail could be found".into()))?;
+            .ok_or(MediaError::NoThumbnail)?;
         let bytes = image::resize(
             &poster.bytes,
             image::ImageType::Jpeg,

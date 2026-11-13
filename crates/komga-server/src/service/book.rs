@@ -314,6 +314,9 @@ pub fn generate_thumbnail_and_persist(
         Ok(generated) => {
             persist_generated_thumbnail(state, book, generated.bytes);
         }
+        Err(error @ komga_media::MediaError::NoThumbnail) => {
+            tracing::warn!("No thumbnail or poster found: {error}");
+        }
         Err(e) => tracing::error!("Error while creating thumbnail: {e}"),
     }
     Ok(())
@@ -1247,6 +1250,41 @@ mod tests {
                 assert!(!hashed, "page {index} should not be hashed");
             }
         }
+    }
+
+    #[test]
+    fn generate_thumbnail_and_persist_warns_when_no_poster_is_found() {
+        let state = test_state();
+        seed_library(&state, "lib1", true);
+        seed_series(&state, "lib1", "s1");
+        let book = seed_book(&state, "lib1", "s1", "file:/l/s/empty.cbz", 0);
+        let dao = MediaDao::new(state.db.clone());
+        let mut media = dao.find_by_id(&book.id).unwrap().unwrap();
+        media.status = MediaStatus::Ready;
+        media.media_type = Some(komga_media::detect::APPLICATION_ZIP.to_string());
+        dao.update(&media).unwrap();
+
+        let dir = tmpdir();
+        let log_path = dir.join("thumbnail.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(std::sync::Mutex::new(
+                std::fs::File::create(&log_path).unwrap(),
+            ))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            generate_thumbnail_and_persist(&state, &book, false).unwrap();
+        });
+
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("WARN"), "{log}");
+        assert!(log.contains("No thumbnail or poster found"), "{log}");
+        assert!(!log.contains("ERROR"), "{log}");
+        assert!(ThumbnailBookDao::new(state.db.clone())
+            .find_all_by_book_id(&book.id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -15,7 +15,7 @@ Rules for working in this repository. They apply to humans and agents alike.
 
 ## Compatibility (the core promise)
 
-kmrs is a drop-in, data-level compatible reimplementation of [gotson/komga](https://github.com/gotson/komga); the compatibility target is **komga 1.30.0**.
+kmrs is a drop-in, data-level compatible reimplementation of [gotson/komga](https://github.com/gotson/komga); the compatibility target is **komga 1.30.1**.
 
 - The schemas of `database.sqlite` and `tasks.sqlite` are byte-for-byte the Java Flyway migrations. `crates/komga-db/tests/schema_contract.rs` enforces this by running the vendored migration files (`crates/komga-db/migrations*`) against the Rust migrator.
 - kmrs-private state never goes into the main database. It lives in `kmrs.sqlite` — its own migration track (`crates/komga-db/migrations_kmrs/`, `kmrs_migrations()`), its own connection, its own config key (`kmrs-db` / `KOMGA_KMRSDB_FILE`) — so the Java version can always open a kmrs-written data directory. The one exception is a kmrs-only server setting: it may be a `SERVER_SETTINGS` row keyed with a `KMRS_` prefix, because the Java version only reads the keys it knows and ignores extra rows. It is exposed as an optional field on `/api/v1/settings`.
