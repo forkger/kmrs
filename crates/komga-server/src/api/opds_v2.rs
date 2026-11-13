@@ -8,7 +8,7 @@ use crate::api::restriction;
 use crate::auth::MaybeAuth;
 use crate::error::ApiError;
 use crate::http::base_url::base_url;
-use crate::http::headers::{check_not_modified, content_disposition, format_http_date};
+use crate::http::headers::{check_not_modified, format_http_date};
 use crate::http::pagination::{QueryExt, QueryPageable};
 use crate::search_index::searcher;
 use crate::state::AppState;
@@ -564,7 +564,6 @@ fn require_media(state: &AppState, book_id: &str) -> Result<Media, ApiError> {
         .ok_or_else(|| ApiError::Internal(format!("no media for book {book_id}")))
 }
 
-// same source as api/books.rs (extract_page / image_page_response helpers are private there)
 fn last_modified_millis(media: &Media) -> i64 {
     (media.last_modified_date.unix_timestamp_nanos() / 1_000_000) as i64
 }
@@ -2425,26 +2424,13 @@ async fn get_book_page(
     .map_err(|e| ApiError::Internal(e.to_string()))?
     .map_err(map_media_error)?;
 
-    let extension = detect::media_type_to_extension(&page_content.media_type).unwrap_or("jpeg");
-    let mut response = Response::new(axum::body::Body::from(page_content.bytes));
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&content_disposition(
-            "inline",
-            &format!("{}-{page_number}{extension}", book.name),
-        ))
-        .unwrap(),
-    );
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_str(&detect::media_type_or_default(Some(
-            &page_content.media_type,
-        )))
-        .unwrap(),
-    );
-    set_last_modified(&mut response, &media);
-    Ok(response)
+    Ok(super::books::image_page_response(
+        &book,
+        &media,
+        page_number,
+        page_content,
+        true,
+    ))
 }
 
 async fn get_webpub_manifest(
@@ -3302,7 +3288,41 @@ mod tests {
             "inline; filename=\"=?UTF-8?Q?b9-1.png?=\"; filename*=UTF-8''b9-1.png"
         );
         assert!(headers.contains_key(header::LAST_MODIFIED));
+        assert_eq!(
+            headers[header::CONTENT_SECURITY_POLICY],
+            "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        );
         assert!(!body.is_empty());
+
+        let mut request = get("/opds/v2/books/b9/pages/1", ADMIN_KEY);
+        request.headers_mut().insert(
+            header::IF_MODIFIED_SINCE,
+            headers[header::LAST_MODIFIED].clone(),
+        );
+        let (status, headers, body) = call(&state, router(), request).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+        assert!(!headers.contains_key(header::CONTENT_SECURITY_POLICY));
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pages_endpoint_converted_page_has_csp() {
+        let state = test_state();
+        seed_base(&state.db);
+        seed_zip_book(&state.db, "l1", "s9", "b9");
+        let (status, headers, body) = call(
+            &state,
+            router(),
+            get("/opds/v2/books/b9/pages/1?convert=jpeg", ADMIN_KEY),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(
+            headers[header::CONTENT_SECURITY_POLICY],
+            "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        );
+        assert!(body.starts_with(b"\xFF\xD8\xFF"));
     }
 
     #[tokio::test]

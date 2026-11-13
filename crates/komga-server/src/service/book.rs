@@ -491,7 +491,9 @@ pub fn get_thumbnail_bytes_original(
         let media = MediaDao::new(state.db.clone())
             .find_by_id(book_id)?
             .expect("book references a missing media");
-        Ok(analyzer_for(state).get_poster(&book_path(&book), &media))
+        analyzer_for(state)
+            .get_poster(&book_path(&book), &media)
+            .map_err(|error| service_error(error.to_string()))
     } else {
         get_thumbnail_bytes(state, book_id, None)
     }
@@ -1281,6 +1283,51 @@ mod tests {
         assert!(log.contains("WARN"), "{log}");
         assert!(log.contains("No thumbnail or poster found"), "{log}");
         assert!(!log.contains("ERROR"), "{log}");
+        assert!(ThumbnailBookDao::new(state.db.clone())
+            .find_all_by_book_id(&book.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn generate_thumbnail_and_persist_logs_pdf_extraction_failures_as_errors() {
+        let state = test_state();
+        seed_library(&state, "lib1", true);
+        seed_series(&state, "lib1", "s1");
+        let dir = tmpdir();
+        let pdf_path = dir.join("missing.pdf");
+        let book = seed_book(
+            &state,
+            "lib1",
+            "s1",
+            &format!("file:{}", pdf_path.display()),
+            0,
+        );
+        let dao = MediaDao::new(state.db.clone());
+        let mut media = dao.find_by_id(&book.id).unwrap().unwrap();
+        media.status = MediaStatus::Ready;
+        media.media_type = Some(komga_media::detect::APPLICATION_PDF.to_string());
+        dao.update(&media).unwrap();
+
+        let log_path = dir.join("thumbnail.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(std::sync::Mutex::new(
+                std::fs::File::create(&log_path).unwrap(),
+            ))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            generate_thumbnail_and_persist(&state, &book, false).unwrap();
+        });
+
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("ERROR"), "{log}");
+        assert!(
+            log.contains("Error while creating thumbnail: file not found:"),
+            "{log}"
+        );
+        assert!(!log.contains("No thumbnail or poster found"), "{log}");
         assert!(ThumbnailBookDao::new(state.db.clone())
             .find_all_by_book_id(&book.id)
             .unwrap()

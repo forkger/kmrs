@@ -1108,7 +1108,7 @@ fn raw_page_response(
     response
 }
 
-fn image_page_response(
+pub(super) fn image_page_response(
     book: &Book,
     media: &Media,
     page_number: i32,

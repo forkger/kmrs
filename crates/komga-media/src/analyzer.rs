@@ -447,7 +447,7 @@ impl Analyzer {
             return Err(MediaError::NotReady);
         }
         let poster = self
-            .get_poster(book_path, media)
+            .get_poster(book_path, media)?
             .ok_or(MediaError::NoThumbnail)?;
         let bytes = image::resize(
             &poster.bytes,
@@ -465,29 +465,38 @@ impl Analyzer {
     }
 
     /// `BookAnalyzer.getPoster`
-    pub fn get_poster(&self, book_path: &Path, media: &Media) -> Option<PageContent> {
+    pub fn get_poster(&self, book_path: &Path, media: &Media) -> Result<Option<PageContent>> {
         match container::media_profile(media.media_type.as_deref()) {
             Some(MediaProfile::Divina) => self.find_best_cover_page(book_path, media),
             Some(MediaProfile::Pdf) => {
-                let bytes = pdf::get_page_content_as_image(book_path, 1).ok()?;
-                Some(PageContent {
+                let bytes = pdf::get_page_content_as_image(book_path, 1)?;
+                Ok(Some(PageContent {
                     bytes,
                     media_type: detect::IMAGE_JPEG.to_string(),
-                })
+                }))
             }
-            Some(MediaProfile::Epub) => get_cover(book_path).or_else(|| {
+            Some(MediaProfile::Epub) => {
+                match get_cover(book_path) {
+                    Ok(Some(cover)) => return Ok(Some(cover)),
+                    Err(error) if !media.epub_divina_compatible || media.pages.is_empty() => {
+                        return Err(error);
+                    }
+                    _ => {}
+                }
                 if media.epub_divina_compatible {
-                    let page = media.pages.first()?;
-                    let bytes = container::get_page_content(book_path, media, 1).ok()?;
-                    Some(PageContent {
+                    let Some(page) = media.pages.first() else {
+                        return Ok(None);
+                    };
+                    let bytes = container::get_page_content(book_path, media, 1)?;
+                    Ok(Some(PageContent {
                         bytes,
                         media_type: page.media_type.clone(),
-                    })
+                    }))
                 } else {
-                    None
+                    Ok(None)
                 }
-            }),
-            None => None,
+            }
+            None => Ok(None),
         }
     }
 
@@ -497,24 +506,19 @@ impl Analyzer {
     /// Blank/undecodable first pages are skipped in favor of a later candidate; when
     /// every candidate fails, the first page is returned anyway so a cover is produced
     /// rather than lost.
-    fn find_best_cover_page(&self, book_path: &Path, media: &Media) -> Option<PageContent> {
+    fn find_best_cover_page(&self, book_path: &Path, media: &Media) -> Result<Option<PageContent>> {
         let page_count = media.page_count.max(0) as usize;
         let numbers: Vec<usize> = (1..=page_count).take(3).collect();
         if numbers.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // one container open covers the whole search, fallback included (network mounts
         // charge per open); a per-page failure is logged and skipped instead of aborting
-        let mut reader = match container::PagesReader::open(book_path, media, &numbers) {
-            Ok(reader) => reader,
-            Err(e) => {
-                tracing::error!("Error while opening book for cover selection: {e}");
-                return None;
-            }
-        };
+        let mut reader = container::PagesReader::open(book_path, media, &numbers)?;
         // page 1 doubles as the fallback, so keep its bytes when it read but did not qualify
         let mut fallback = None;
+        let mut read_error = None;
         for number in &numbers {
             let bytes = match reader.read_page(*number) {
                 Ok(bytes) => bytes,
@@ -523,19 +527,24 @@ impl Analyzer {
                         "Error while reading cover candidate page {number} of {}: {e}",
                         book_path.display()
                     );
+                    read_error.get_or_insert(e);
                     continue;
                 }
             };
             let media_type = media.pages[*number - 1].media_type.clone();
             if image::is_suitable_cover_image(&bytes) {
-                return Some(PageContent { bytes, media_type });
+                return Ok(Some(PageContent { bytes, media_type }));
             }
             tracing::debug!("Page {number} is not a suitable cover (blank or undecodable)");
             if *number == 1 {
                 fallback = Some(PageContent { bytes, media_type });
             }
         }
-        fallback
+        match (fallback, read_error) {
+            (Some(page), _) => Ok(Some(page)),
+            (None, Some(error)) => Err(error),
+            (None, None) => Ok(None),
+        }
     }
 
     /// `BookAnalyzer.hashPages`: hashes the first and last `page_hashing` pages whose hash is
@@ -1017,16 +1026,21 @@ impl EpubPackage {
         None
     }
 
-    fn read_entry_bytes(&mut self, name: &str) -> Option<Vec<u8>> {
+    fn read_entry_bytes(&mut self, name: &str) -> Result<Vec<u8>> {
         let trimmed = name.trim_start_matches('/');
         for candidate in std::iter::once(name).chain((trimmed != name).then_some(trimmed)) {
-            if let Ok(mut entry) = zip_utils::by_name_decoded(&mut self.archive, candidate) {
-                let mut buf = Vec::with_capacity(entry.size() as usize);
-                entry.read_to_end(&mut buf).ok()?;
-                return Some(buf);
-            }
+            let mut entry = match zip_utils::by_name_decoded(&mut self.archive, candidate) {
+                Ok(entry) => entry,
+                Err(zip::result::ZipError::FileNotFound) => continue,
+                Err(error) => return Err(MediaError::Other(error.into())),
+            };
+            let mut buf = Vec::with_capacity(entry.size() as usize);
+            entry
+                .read_to_end(&mut buf)
+                .map_err(|error| MediaError::Other(error.into()))?;
+            return Ok(buf);
         }
-        None
+        Err(MediaError::EntryNotFound(name.to_string()))
     }
 
     fn read_entry_head(&mut self, name: &str, max: usize) -> Option<Vec<u8>> {
@@ -1278,6 +1292,7 @@ fn get_divina_pages(
             image::get_dimension(&head)
                 .or_else(|| {
                     pkg.read_entry_bytes(image_path)
+                        .ok()
                         .and_then(|bytes| image::get_dimension(&bytes))
                 })
                 .map(|(w, h)| (w as i32, h as i32))
@@ -1491,7 +1506,7 @@ fn is_kepub(pkg: &mut EpubPackage, resources: &[MediaFile]) -> bool {
         .iter()
         .filter(|r| r.sub_type == Some(MediaFileSubType::EpubPage))
     {
-        let Some(content) = pkg.read_entry_bytes(&file.file_name) else {
+        let Ok(content) = pkg.read_entry_bytes(&file.file_name) else {
             continue;
         };
         if contains_kobo_span_class(&content) {
@@ -2055,8 +2070,8 @@ fn text_content(node: &roxmltree::Node<'_, '_>) -> String {
 /// `id="cover-image"` → guide cover (with in-page image extraction for XHTML/HTML) →
 /// id containing "cover" → href containing "cover". Candidates are tried in order and
 /// the first one that reads from the archive wins.
-fn get_cover(book_path: &Path) -> Option<PageContent> {
-    let mut pkg = open_epub(book_path).ok()?;
+fn get_cover(book_path: &Path) -> Result<Option<PageContent>> {
+    let mut pkg = open_epub(book_path)?;
     let cover_image_property = pkg
         .manifest
         .iter()
@@ -2067,7 +2082,8 @@ fn get_cover(book_path: &Path) -> Option<PageContent> {
         })
         .cloned();
     let metadata_cover_item = {
-        let doc = parse_xml(&pkg.opf_content).ok()?;
+        let doc = parse_xml(&pkg.opf_content)
+            .map_err(|error| MediaError::unsupported(format!("could not parse OPF: {error}")))?;
         let meta_cover = doc
             .descendants()
             .filter(|n| n.is_element() && n.tag_name().name() == "metadata")
@@ -2114,6 +2130,7 @@ fn get_cover(book_path: &Path) -> Option<PageContent> {
         })
         .cloned();
 
+    let mut read_error = None;
     for item in [
         cover_image_property,
         metadata_cover_item,
@@ -2126,15 +2143,22 @@ fn get_cover(book_path: &Path) -> Option<PageContent> {
     .flatten()
     {
         let cover_path = normalize_href(pkg.opf_dir.as_deref(), &item.href);
-        let Some(bytes) = pkg.read_entry_bytes(&cover_path) else {
-            continue;
+        let bytes = match pkg.read_entry_bytes(&cover_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                read_error.get_or_insert(error);
+                continue;
+            }
         };
-        return Some(PageContent {
+        return Ok(Some(PageContent {
             bytes,
             media_type: item.media_type,
-        });
+        }));
     }
-    None
+    match read_error {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
 }
 
 /// Guide cover fallback: `<guide><reference type="cover">`. XHTML/HTML targets
@@ -2474,7 +2498,10 @@ mod tests {
         write_zip(&book, &[("p1.png", &p1), ("p2.png", &p2)]);
         let media = divina_media(&[("p1.png", "image/png"), ("p2.png", "image/png")]);
 
-        let poster = analyzer().find_best_cover_page(&book, &media).unwrap();
+        let poster = analyzer()
+            .find_best_cover_page(&book, &media)
+            .unwrap()
+            .unwrap();
         assert_eq!(poster.bytes, p2);
         assert_eq!(poster.media_type, detect::IMAGE_PNG);
     }
@@ -2488,7 +2515,10 @@ mod tests {
         write_zip(&book, &[("p1.png", &p1), ("p2.png", &p2)]);
         let media = divina_media(&[("p1.png", "image/png"), ("p2.png", "image/png")]);
 
-        let poster = analyzer().find_best_cover_page(&book, &media).unwrap();
+        let poster = analyzer()
+            .find_best_cover_page(&book, &media)
+            .unwrap()
+            .unwrap();
         assert_eq!(poster.bytes, p1);
     }
 
@@ -2503,7 +2533,10 @@ mod tests {
         write_zip(&book, &[("p1.png", &p1), ("p2.png", &p2)]);
         let media = divina_media(&[("p1.png", "image/png"), ("p2.png", "image/png")]);
 
-        let poster = analyzer().find_best_cover_page(&book, &media).unwrap();
+        let poster = analyzer()
+            .find_best_cover_page(&book, &media)
+            .unwrap()
+            .unwrap();
         assert_eq!(poster.bytes, p1);
     }
 
@@ -2515,7 +2548,10 @@ mod tests {
         write_zip(&book, &[("p1.png", &p1)]);
         let media = divina_media(&[("p1.png", "image/png")]);
 
-        let poster = analyzer().find_best_cover_page(&book, &media).unwrap();
+        let poster = analyzer()
+            .find_best_cover_page(&book, &media)
+            .unwrap()
+            .unwrap();
         assert_eq!(poster.bytes, p1);
     }
 
@@ -2526,7 +2562,10 @@ mod tests {
         write_zip(&book, &[]);
         let media = divina_media(&[]);
 
-        assert!(analyzer().find_best_cover_page(&book, &media).is_none());
+        assert!(analyzer()
+            .find_best_cover_page(&book, &media)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2537,8 +2576,35 @@ mod tests {
         write_zip(&book, &[("p1.png", b"not an image"), ("p2.png", &p2)]);
         let media = divina_media(&[("p1.png", "image/png"), ("p2.png", "image/png")]);
 
-        let poster = analyzer().find_best_cover_page(&book, &media).unwrap();
+        let poster = analyzer()
+            .find_best_cover_page(&book, &media)
+            .unwrap()
+            .unwrap();
         assert_eq!(poster.bytes, p2);
+    }
+
+    #[test]
+    fn cover_skips_missing_first_page_for_second() {
+        let dir = tmpdir("cover-missing-first");
+        let book = dir.join("book.cbz");
+        let image = make_png(48, 48);
+        write_zip(&book, &[("page.png", &image)]);
+        let media = divina_media(&[("missing.png", "image/png"), ("page.png", "image/png")]);
+
+        let poster = analyzer().get_poster(&book, &media).unwrap().unwrap();
+        assert_eq!(poster.bytes, image);
+    }
+
+    #[test]
+    fn cover_keeps_blank_first_page_when_later_entry_is_missing() {
+        let dir = tmpdir("cover-missing-later");
+        let book = dir.join("book.cbz");
+        let image = make_white_png(100, 100);
+        write_zip(&book, &[("page.png", &image)]);
+        let media = divina_media(&[("page.png", "image/png"), ("missing.png", "image/png")]);
+
+        let poster = analyzer().get_poster(&book, &media).unwrap().unwrap();
+        assert_eq!(poster.bytes, image);
     }
 
     // endregion cover selection
@@ -3124,6 +3190,7 @@ mod tests {
         let media = a.analyze(&path, false).media;
         let poster = a
             .get_poster(&path, &media)
+            .unwrap()
             .expect("cover via guide xhtml img with utf8 percent-encoded path");
         assert_eq!(poster.media_type, detect::IMAGE_PNG);
         assert_eq!(poster.bytes, img);
@@ -3152,6 +3219,7 @@ mod tests {
         let media = a.analyze(&path, false).media;
         let poster = a
             .get_poster(&path, &media)
+            .unwrap()
             .expect("cover via guide direct image");
         assert_eq!(poster.media_type, detect::IMAGE_PNG);
         assert_eq!(poster.bytes, img);
@@ -3179,7 +3247,7 @@ mod tests {
         );
         let a = analyzer();
         let media = a.analyze(&p1, false).media;
-        assert_eq!(a.get_poster(&p1, &media).unwrap().bytes, img);
+        assert_eq!(a.get_poster(&p1, &media).unwrap().unwrap().bytes, img);
 
         // <meta name="Cover" content="custom-id"/>
         let opf_meta = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -3197,7 +3265,7 @@ mod tests {
             &[("cover.png", img.as_slice())],
         );
         let media = a.analyze(&p2, false).media;
-        assert_eq!(a.get_poster(&p2, &media).unwrap().bytes, img);
+        assert_eq!(a.get_poster(&p2, &media).unwrap().unwrap().bytes, img);
     }
 
     #[test]
@@ -3228,6 +3296,7 @@ mod tests {
         let media = a.analyze(&path, false).media;
         let poster = a
             .get_poster(&path, &media)
+            .unwrap()
             .expect("cover via id/href heuristics");
         assert_eq!(poster.media_type, detect::IMAGE_PNG);
     }
@@ -3255,8 +3324,55 @@ mod tests {
         let media = a.analyze(&path, false).media;
         let poster = a
             .get_poster(&path, &media)
+            .unwrap()
             .expect("cover falls back past the missing candidate");
         assert_eq!(poster.bytes, img);
+    }
+
+    #[test]
+    fn get_poster_epub_without_cover_returns_none() {
+        let dir = tmpdir("epub-without-cover");
+        let opf = r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata/>
+  <manifest/>
+  <spine/>
+</package>"#;
+        let path = write_epub(&dir, "book.epub", opf, &[]);
+        let media = media(
+            MediaStatus::Ready,
+            Some(detect::APPLICATION_EPUB.into()),
+            None,
+        );
+        assert!(analyzer().get_poster(&path, &media).unwrap().is_none());
+        assert!(matches!(
+            analyzer().generate_thumbnail(&path, &media),
+            Err(MediaError::NoThumbnail)
+        ));
+    }
+
+    #[test]
+    fn get_poster_epub_divina_falls_back_from_missing_cover() {
+        let dir = tmpdir("epub-divina-missing-cover");
+        let opf = r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata/>
+  <manifest>
+    <item id="cover" href="missing.png" media-type="image/png" properties="cover-image"/>
+    <item id="page" href="page.png" media-type="image/png"/>
+  </manifest>
+  <spine/>
+</package>"#;
+        let image = make_png(48, 48);
+        let path = write_epub(&dir, "book.epub", opf, &[("page.png", &image)]);
+        let mut media = divina_media(&[("page.png", detect::IMAGE_PNG)]);
+        media.media_type = Some(detect::APPLICATION_EPUB.into());
+        assert!(matches!(
+            analyzer().generate_thumbnail(&path, &media),
+            Err(MediaError::EntryNotFound(_))
+        ));
+
+        media.epub_divina_compatible = true;
+        let poster = analyzer().get_poster(&path, &media).unwrap().unwrap();
+        assert_eq!(poster.bytes, image);
     }
 
     // endregion epub cover fallbacks
@@ -3555,11 +3671,44 @@ mod tests {
     }
 
     #[test]
+    fn generate_thumbnail_preserves_extraction_errors() {
+        let dir = tmpdir("thumbnail-extraction-errors");
+        let missing = dir.join("missing-book");
+        for media_type in [
+            detect::APPLICATION_PDF,
+            detect::APPLICATION_ZIP,
+            detect::APPLICATION_EPUB,
+        ] {
+            let mut media = divina_media(&[("page.png", detect::IMAGE_PNG)]);
+            media.media_type = Some(media_type.to_string());
+            let result = analyzer().generate_thumbnail(&missing, &media);
+            assert!(
+                matches!(result, Err(MediaError::NoSuchFile(_))),
+                "{media_type}: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    #[test]
+    fn generate_thumbnail_reports_missing_archive_entries_as_errors() {
+        let dir = tmpdir("thumbnail-missing-entries");
+        let book = dir.join("book.cbz");
+        write_zip(&book, &[]);
+        let media = divina_media(&[("missing.png", detect::IMAGE_PNG)]);
+        assert!(matches!(
+            analyzer().generate_thumbnail(&book, &media),
+            Err(MediaError::EntryNotFound(_))
+        ));
+    }
+
+    #[test]
     fn get_poster_zip_first_page() {
         let a = analyzer();
         let media = a.analyze(&fixtures().join("archives/zip.zip"), false).media;
         let poster = a
             .get_poster(&fixtures().join("archives/zip.zip"), &media)
+            .unwrap()
             .unwrap();
         assert_eq!(poster.media_type, detect::IMAGE_PNG);
         assert_eq!(&poster.bytes[0..4], b"\x89PNG");
@@ -3573,6 +3722,7 @@ mod tests {
             .media;
         let poster = a
             .get_poster(&fixtures().join("archives/epub3.epub"), &media)
+            .unwrap()
             .unwrap();
         assert_eq!(poster.media_type, detect::IMAGE_JPEG);
         assert_eq!(&poster.bytes[0..3], b"\xFF\xD8\xFF");
