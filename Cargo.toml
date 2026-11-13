@@ -42,7 +42,6 @@ crc32fast = "1"
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 # icu
 icu_collator = "2"
-icu_normalizer = "2"
 icu_locale = "2"
 # cli / config
 clap = { version = "4", features = ["derive"] }
@@ -70,7 +69,6 @@ jiff = "0.2"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 roxmltree = "0.21"
 scraper = "0.29"
-compress-tools = { version = "0.16", default-features = false, features = ["static"] }
 # `thread_safe` (default) stays on: pdfium-render 0.9 allows exactly one bindings object
 # per process and serializes every FFI call behind a mutex, so per-thread bindings are
 # impossible; the global PDF document cache in komga-media relies on it for Sync

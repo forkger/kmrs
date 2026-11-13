@@ -1,6 +1,6 @@
 //! Outbound generic JSON webhooks.
 //!
-//! kmrs enhancement with no Java equivalent: every [`DomainEvent`](crate::events::DomainEvent)
+//! kmrs enhancement with no Java equivalent: every [`DomainEvent`]
 //! is POSTed as `{event, timestamp, data}` to the configured URLs. The dispatcher
 //! subscribes to the broadcast bus directly (same pattern as `search_index::consume_events`);
 //! it never goes through the SSE wire format. Event names and `data` shapes reuse the

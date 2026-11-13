@@ -75,7 +75,7 @@ fn bind_uncached() -> Result<Pdfium> {
 /// Returns the process-wide `Pdfium` binding, initialized on first use.
 /// A failed probe is cached too: library availability does not change at runtime.
 /// The cached message is reused as-is (it already carries the full
-/// "libpdfium is not available: <detail>" wording from `bind_uncached`).
+/// `libpdfium is not available: <detail>` wording from `bind_uncached`).
 pub fn pdfium() -> Result<&'static Pdfium> {
     PDFIUM
         .get_or_init(|| bind_uncached().map_err(|e| e.to_string()))

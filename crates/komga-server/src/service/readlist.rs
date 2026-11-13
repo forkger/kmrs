@@ -299,7 +299,7 @@ pub fn match_comic_rack_list(
     })
 }
 
-/// CBL matching failures: request-level problems surface as 400 through [`CodedError`],
+/// CBL matching failures: request-level problems surface as 400 through [`CodedError`](komga_core::error::CodedError),
 /// a database failure is a server-side 500 — a transient pool timeout must not come out
 /// as "no books matched".
 #[derive(Debug, thiserror::Error)]

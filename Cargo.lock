@@ -1958,15 +1958,12 @@ version = "0.27.2"
 dependencies = [
  "crc32fast",
  "flate2",
- "icu_collator",
  "icu_locale",
- "icu_normalizer",
  "komga-core",
  "r2d2",
  "r2d2_sqlite",
  "regex",
  "rusqlite",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -2011,8 +2008,6 @@ name = "komga-search"
 version = "0.27.2"
 dependencies = [
  "komga-core",
- "serde",
- "serde_json",
  "tantivy",
  "tempfile",
  "thiserror",
@@ -5233,7 +5228,6 @@ name = "xtask"
 version = "0.27.2"
 dependencies = [
  "anyhow",
- "crc32fast",
  "komga-db",
  "rusqlite",
 ]

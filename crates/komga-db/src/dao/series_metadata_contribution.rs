@@ -3,7 +3,7 @@
 //! aggregates without re-opening any book file.
 //!
 //! The schema, columns and upsert SQL follow the reference implementation
-//! (https://github.com/huihuimoe/komga-riir); only the host database differs.
+//! (<https://github.com/huihuimoe/komga-riir>); only the host database differs.
 
 use crate::pool::Database;
 use crate::Result;

@@ -109,8 +109,8 @@ pub struct FileCors {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct FileDatabase {
     pub file: Option<PathBuf>,
-    /// read pool size; None = min(CPU cores, max-pool-size) for [database],
-    /// [`DEFAULT_AUX_READERS`] for the auxiliary [tasks-db]/[kmrs-db]/[sessions-db] pools
+    /// read pool size; None = min(CPU cores, max-pool-size) for `[database]`,
+    /// [`DEFAULT_AUX_READERS`] for the auxiliary `[tasks-db]`/`[kmrs-db]`/`[sessions-db]` pools
     pub pool_size: Option<u32>,
     pub max_pool_size: Option<u32>,
     pub journal_mode: Option<String>,
