@@ -690,21 +690,17 @@ pub(crate) async fn parse_thumbnail_upload(
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| ApiError::bad_request(e.to_string()))?
+        .map_err(crate::http::body_limit::multipart_error)?
     {
         match field.name() {
             Some("file") => {
-                let bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|e| ApiError::bad_request(e.to_string()))?;
-                file = Some(bytes.to_vec());
+                file = Some(crate::http::body_limit::file_bytes(field).await?);
             }
             Some("selected") => {
                 let text = field
                     .text()
                     .await
-                    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+                    .map_err(crate::http::body_limit::multipart_error)?;
                 selected = text.trim().eq_ignore_ascii_case("true");
             }
             _ => {}
@@ -4577,6 +4573,48 @@ mod tests {
             .unwrap()
             .to_vec();
         (status, headers, bytes)
+    }
+
+    /// Through the server's own router, every way an upload can be too large is refused
+    /// as too large and not as a malformed request.
+    #[tokio::test]
+    async fn book_thumbnail_upload_over_the_size_limit_is_refused() {
+        use crate::http::body_limit::testing::{
+            assert_upload_too_large, send_to_server, send_to_server_in_frames,
+        };
+        let limit = crate::http::body_limit::MAX_UPLOAD_FILE_SIZE;
+        let state = test_state_with_settings();
+        seed_library(&state.db, "lib1");
+        seed_series(&state.db, "s1", "lib1");
+        seed_book(&state.db, "b1", "s1", "lib1", "file:/data/b1.cbz");
+        seed_user(&state.db, "admin@example.org", "pw", true);
+        let upload = |file: &[u8], selected: Option<&str>| {
+            let (content_type, body) = multipart_body(file, selected);
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/books/b1/thumbnails")
+                .header("authorization", basic("admin@example.org", "pw"))
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let cover = |size: usize| {
+            let mut image = tiny_png();
+            image.resize(size, 0);
+            image
+        };
+
+        // a cover one byte over the limit, in a body that is within the body limit
+        let (status, body) = send_to_server(&state, upload(&cover(limit + 1), None)).await;
+        assert_upload_too_large(status, &body);
+        // a cover over the body limit that is there all at once
+        let (status, body) = send_to_server(&state, upload(&cover(3 * limit), None)).await;
+        assert_upload_too_large(status, &body);
+        // a small cover next to a part that crosses the body limit while it is read
+        let other_part = "x".repeat(2 * limit);
+        let request = upload(&tiny_png(), Some(&other_part));
+        let (status, body) = send_to_server_in_frames(&state, request).await;
+        assert_upload_too_large(status, &body);
     }
 
     #[tokio::test]

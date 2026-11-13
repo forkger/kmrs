@@ -18,9 +18,6 @@ pub fn router() -> Router<AppState> {
 /// Upper bound for `recentReadingDays` (ten years): larger windows behave like off anyway.
 const MAX_RECENT_READING_DAYS: u32 = 3650;
 
-/// Spring Boot's default `spring.servlet.multipart.max-file-size` (komga does not override it)
-const DEFAULT_MAX_FILE_SIZE_BYTES: i64 = 1_048_576;
-
 async fn get_server_settings(
     State(state): State<AppState>,
     auth: RequireAuth,
@@ -56,7 +53,7 @@ async fn get_server_settings(
                 .kepubify_path(config)
                 .map(|p| p.display().to_string()),
         }),
-        max_upload_file_size_bytes: Some(DEFAULT_MAX_FILE_SIZE_BYTES),
+        max_upload_file_size_bytes: Some(crate::http::body_limit::MAX_UPLOAD_FILE_SIZE as i64),
         skip_read_on_next: Some(s.next_skip_read),
         recent_reading_days: Some(i64::from(s.recent_reading_days)),
     };
@@ -175,7 +172,12 @@ mod tests {
         );
         assert_eq!(json["koboProxy"], false);
         assert_eq!(json["skipReadOnNext"], false);
-        assert_eq!(json["maxUploadFileSizeBytes"], 1_048_576);
+        assert_eq!(json["maxUploadFileSizeBytes"], 2 * 1024 * 1024);
+        // the limit the server enforces, not a number of its own
+        assert_eq!(
+            json["maxUploadFileSizeBytes"],
+            crate::http::body_limit::MAX_UPLOAD_FILE_SIZE
+        );
         assert_eq!(json["recentReadingDays"], 0);
 
         // non-admin: only maxUploadFileSizeBytes, skipReadOnNext and recentReadingDays survive
@@ -185,7 +187,11 @@ mod tests {
             (s, serde_json::from_slice::<serde_json::Value>(&b).unwrap())
         };
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["maxUploadFileSizeBytes"], 1_048_576);
+        // the limit the server enforces, not a number of its own
+        assert_eq!(
+            json["maxUploadFileSizeBytes"],
+            crate::http::body_limit::MAX_UPLOAD_FILE_SIZE
+        );
         assert_eq!(json["recentReadingDays"], 0);
         assert!(json.get("taskPoolSize").is_none());
         assert!(json.get("serverPort").is_none());

@@ -346,23 +346,17 @@ async fn parse_thumbnail_upload(
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| ApiError::bad_request(e.to_string()))?
+        .map_err(crate::http::body_limit::multipart_error)?
     {
         match field.name() {
             Some("file") => {
-                bytes = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|e| ApiError::bad_request(e.to_string()))?
-                        .to_vec(),
-                );
+                bytes = Some(crate::http::body_limit::file_bytes(field).await?);
             }
             Some("selected") => {
                 let value = field
                     .text()
                     .await
-                    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+                    .map_err(crate::http::body_limit::multipart_error)?;
                 selected = value.eq_ignore_ascii_case("true");
             }
             _ => {}
@@ -1456,6 +1450,106 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// A cover over the size limit is refused as too large, not as a malformed request,
+    /// and nothing is stored.
+    #[tokio::test]
+    async fn thumbnail_upload_over_the_size_limit_is_refused() {
+        let state = test_state();
+        seed_base(&state.db);
+        use crate::http::body_limit::testing::{
+            assert_upload_too_large, send_to_server, send_to_server_in_frames,
+        };
+        let limit = crate::http::body_limit::MAX_UPLOAD_FILE_SIZE;
+        let path = "/api/v1/collections/c1/thumbnails";
+        let mut image = tiny_jpeg();
+        image.resize(limit + 1, 0);
+
+        // through the server's own router: a cover one byte over the limit, in a body
+        // that is within the body limit
+        let request = multipart_request(path, ADMIN_KEY, &image, None);
+        let (status, body) = send_to_server(&state, request).await;
+        assert_upload_too_large(status, &body);
+        // a cover over the body limit that is there all at once
+        image.resize(3 * limit, 0);
+        let request = multipart_request(path, ADMIN_KEY, &image, None);
+        let (status, body) = send_to_server(&state, request).await;
+        assert_upload_too_large(status, &body);
+        // a small cover next to a part that crosses the body limit while it is read
+        let other_part = "x".repeat(2 * limit);
+        let request = multipart_request(path, ADMIN_KEY, &tiny_jpeg(), Some(&other_part));
+        let (status, body) = send_to_server_in_frames(&state, request).await;
+        assert_upload_too_large(status, &body);
+
+        let (status, _, body) = call(
+            &state,
+            router(),
+            get("/api/v1/collections/c1/thumbnails", ADMIN_KEY),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let stored: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stored, serde_json::json!([]));
+    }
+
+    /// The limit as the server applies it, through the whole router: a cover of exactly
+    /// the advertised size uploads, one byte more and a too-large JSON body are refused
+    /// with a complete error body.
+    #[tokio::test]
+    async fn the_server_applies_the_body_limit_to_its_routes() {
+        use tower::ServiceExt;
+        let state = test_state();
+        seed_base(&state.db);
+        let app = crate::build_router(state.clone());
+        let limit = crate::http::body_limit::MAX_UPLOAD_FILE_SIZE;
+        let send = |request: Request<Body>| {
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let (status, headers) = (response.status(), response.headers().clone());
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                (status, headers, body)
+            }
+        };
+        let cover = |size: usize| {
+            let mut image = tiny_jpeg();
+            image.resize(size, 0);
+            multipart_request("/api/v1/collections/c1/thumbnails", ADMIN_KEY, &image, None)
+        };
+
+        let (status, _, body) = send(cover(limit)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["fileSize"], limit);
+
+        let (status, headers, body) = send(cover(limit + 1)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("Upload is too large: the maximum file size is 2 MB"));
+        assert_eq!(body["path"], "/api/v1/collections/c1/thumbnails");
+        assert!(!headers.contains_key(crate::http::error_path::ERROR_MARKER));
+
+        let json = format!(r#"{{"name":"{}"}}"#, "a".repeat(limit + 128 * 1024));
+        let (status, headers, body) = send(json_request(
+            "POST",
+            "/api/v1/collections",
+            ADMIN_KEY,
+            &json,
+        ))
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("Request body is too large"));
+        assert_eq!(body["path"], "/api/v1/collections");
+        assert!(!headers.contains_key(crate::http::error_path::ERROR_MARKER));
     }
 
     #[tokio::test]

@@ -462,16 +462,10 @@ async fn match_comic_rack_list(
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| ApiError::bad_request(e.to_string()))?
+        .map_err(crate::http::body_limit::multipart_error)?
     {
         if field.name() == Some("file") {
-            file = Some(
-                field
-                    .bytes()
-                    .await
-                    .map_err(|e| ApiError::bad_request(e.to_string()))?
-                    .to_vec(),
-            );
+            file = Some(crate::http::body_limit::file_bytes(field).await?);
         }
     }
     let file =
@@ -561,23 +555,17 @@ pub(crate) async fn parse_thumbnail_upload(
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| ApiError::bad_request(e.to_string()))?
+        .map_err(crate::http::body_limit::multipart_error)?
     {
         match field.name() {
             Some("file") => {
-                bytes = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|e| ApiError::bad_request(e.to_string()))?
-                        .to_vec(),
-                );
+                bytes = Some(crate::http::body_limit::file_bytes(field).await?);
             }
             Some("selected") => {
                 let value = field
                     .text()
                     .await
-                    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+                    .map_err(crate::http::body_limit::multipart_error)?;
                 selected = value.eq_ignore_ascii_case("true");
             }
             _ => {}
@@ -1522,6 +1510,49 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// A cover and a ComicRack list over the size limit are refused as too large, not as
+    /// malformed requests.
+    #[tokio::test]
+    async fn uploads_over_the_size_limit_are_refused() {
+        let state = test_state();
+        seed_base_with_readlists(&state.db);
+        use crate::http::body_limit::testing::{
+            assert_upload_too_large, send_to_server, send_to_server_in_frames,
+        };
+        let limit = crate::http::body_limit::MAX_UPLOAD_FILE_SIZE;
+        let file = |size: usize| {
+            let mut file = tiny_jpeg();
+            file.resize(size, 0);
+            file
+        };
+
+        for (path, name) in [
+            ("/api/v1/readlists/r1/thumbnails", "cover.jpg"),
+            ("/api/v1/readlists/match/comicrack", "list.cbl"),
+        ] {
+            // through the server's own router: a file one byte over the limit, in a body
+            // that is within the body limit
+            let request = multipart_request(path, ADMIN_KEY, &file(limit + 1), name, None);
+            let (status, body) = send_to_server(&state, request).await;
+            assert_upload_too_large(status, &body);
+            // a file over the body limit that is there all at once
+            let request = multipart_request(path, ADMIN_KEY, &file(3 * limit), name, None);
+            let (status, body) = send_to_server(&state, request).await;
+            assert_upload_too_large(status, &body);
+        }
+        // a small cover next to a part that crosses the body limit while it is read
+        let other_part = "x".repeat(2 * limit);
+        let request = multipart_request(
+            "/api/v1/readlists/r1/thumbnails",
+            ADMIN_KEY,
+            &tiny_jpeg(),
+            "cover.jpg",
+            Some(&other_part),
+        );
+        let (status, body) = send_to_server_in_frames(&state, request).await;
+        assert_upload_too_large(status, &body);
     }
 
     #[tokio::test]
