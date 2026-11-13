@@ -7,6 +7,9 @@
 //! (`ApiKeyActivityThrottle`). `/koreader/**` also accepts the KOReader sync header
 //! `X-Auth-User` (the kosync filter chain's converter).
 
+mod login_throttle;
+mod password;
+mod password_cache;
 pub mod remember_me;
 pub mod session;
 
@@ -17,8 +20,10 @@ use axum::middleware::Next;
 use axum::response::Response;
 use komga_core::model::user::{KomgaUser, UserRole};
 use komga_db::dao::user::UserDao;
+use password::PasswordChecksBusy;
 use sha2::{Digest, Sha512};
 
+pub(crate) use password::UserAuthentication;
 pub use session::{SessionStore, SESSION_COOKIE_NAME, SESSION_HEADER_NAME};
 
 /// One successful API-key activity row per key per window: upstream komga writes a row for
@@ -177,7 +182,11 @@ fn session_matching_basic(
         .filter(|user| user.email.eq_ignore_ascii_case(email))
 }
 
-fn resolve(state: &AppState, parts: &Parts, session_id: Option<&str>) -> Outcome {
+async fn resolve(
+    state: &AppState,
+    parts: &Parts,
+    session_id: Option<&str>,
+) -> Result<Outcome, PasswordChecksBusy> {
     let headers = &parts.headers;
     let user_dao = UserDao::new(state.db.clone());
 
@@ -194,7 +203,7 @@ fn resolve(state: &AppState, parts: &Parts, session_id: Option<&str>) -> Outcome
         // is the token's principal name (Java's Hasher), used for the failure activity
         let hashed = sha512_hex(key.trim());
         let masked = komga_media::hash::compute_hash_bytes(key.trim().as_bytes());
-        return match user_dao.find_by_api_key(&hashed) {
+        return Ok(match user_dao.find_by_api_key(&hashed) {
             Ok(Some((user, api_key))) => {
                 // LoginListener records user.id/user.email on success; nulls are for failures.
                 // The context is request-scoped (1.29), so every request re-authenticates; no
@@ -234,7 +243,7 @@ fn resolve(state: &AppState, parts: &Parts, session_id: Option<&str>) -> Outcome
                     source: SOURCE_API_KEY.into(),
                 }),
             },
-        };
+        });
     }
 
     // 2. Basic
@@ -249,7 +258,7 @@ fn resolve(state: &AppState, parts: &Parts, session_id: Option<&str>) -> Outcome
                 session_matching_basic(state, &user_dao, id, &email)
                     .map(|user| (id.to_string(), user))
             }) {
-                return Outcome {
+                return Ok(Outcome {
                     auth: Some(Auth {
                         user,
                         source: AuthSource::Session,
@@ -258,66 +267,18 @@ fn resolve(state: &AppState, parts: &Parts, session_id: Option<&str>) -> Outcome
                     }),
                     new_session_id: None,
                     activity: None,
-                };
+                });
             }
-            let verified = user_dao
-                .find_by_email_ignore_case(&email)
-                .ok()
-                .flatten()
-                .filter(|user| bcrypt::verify(&password, &user.password).unwrap_or(false));
-            return match verified {
-                Some(user) => {
-                    let activity = ActivityDraft {
-                        user_id: Some(user.id.clone()),
-                        email: Some(user.email.clone()),
-                        api_key_id: None,
-                        api_key_comment: None,
-                        success: true,
-                        error: None,
-                        source: SOURCE_PASSWORD.into(),
-                    };
-                    Outcome {
-                        // a broken session store must not fail the authentication itself
-                        new_session_id: state
-                            .sessions
-                            .create(&user.id)
-                            .map_err(|e| {
-                                tracing::warn!(
-                                    "failed to persist session, continuing without one: {e}"
-                                )
-                            })
-                            .ok(),
-                        auth: Some(Auth {
-                            user,
-                            source: AuthSource::Password,
-                            api_key_id: None,
-                            session_id: None,
-                        }),
-                        activity: Some(activity),
-                    }
-                }
-                None => Outcome {
-                    auth: None,
-                    new_session_id: None,
-                    activity: Some(ActivityDraft {
-                        user_id: None,
-                        email: Some(email),
-                        api_key_id: None,
-                        api_key_comment: None,
-                        success: false,
-                        error: Some("Bad credentials".into()),
-                        source: SOURCE_PASSWORD.into(),
-                    }),
-                },
-            };
+            let client = crate::http::client_addr::client_ip(parts, &state.config.trusted_proxies);
+            return state.user_auth.authenticate(email, &password, client).await;
         }
     }
 
-    Outcome {
+    Ok(Outcome {
         auth: None,
         new_session_id: None,
         activity: None,
-    }
+    })
 }
 
 async fn resolve_session_and_remember(
@@ -432,7 +393,19 @@ pub async fn auth_middleware(
 
     let session_id = session_header.or(session_cookie);
 
-    let mut outcome = resolve(&state, &parts, session_id.as_deref());
+    let mut outcome = match resolve(&state, &parts, session_id.as_deref()).await {
+        Ok(outcome) => outcome,
+        // the limit is server-wide, not this client's, hence 503 and not 429
+        Err(PasswordChecksBusy) => {
+            return Response::builder()
+                .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+                .header(axum::http::header::RETRY_AFTER, "1")
+                // reported above, once per interval: not a failure for the request trace
+                .extension(crate::http::request_trace::DeliberateRefusal)
+                .body(axum::body::Body::empty())
+                .unwrap();
+        }
+    };
     if outcome.auth.is_none() && outcome.activity.is_none() {
         outcome = resolve_session_and_remember(&state, &parts, session_id.clone()).await;
     }

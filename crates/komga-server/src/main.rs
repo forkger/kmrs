@@ -41,6 +41,7 @@ use komga_db::pool::Database;
 use komga_db::Migrator;
 use state::AppState;
 use std::sync::Arc;
+use tower_http::classify::SharedClassifier;
 use tower_http::trace::TraceLayer;
 
 /// C libraries allocate through glibc malloc only in builds without the profiling
@@ -218,11 +219,13 @@ async fn run() -> anyhow::Result<()> {
     let search_index =
         Arc::new(komga_search::SearchIndex::open(&config.lucene_dir).context("open search index")?);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let sessions = match sessions_db {
+        Some(db) => auth::SessionStore::jdbc(db, config.session_timeout),
+        None => auth::SessionStore::new(config.session_timeout),
+    };
     let state = AppState {
-        sessions: match sessions_db {
-            Some(db) => auth::SessionStore::jdbc(db, config.session_timeout),
-            None => auth::SessionStore::new(config.session_timeout),
-        },
+        sessions: sessions.clone(),
+        user_auth: Arc::new(auth::UserAuthentication::new(db.clone(), sessions)),
         settings: Arc::new(settings::SettingsProvider::load(db.clone())),
         tsid: Arc::new(komga_core::tsid::TsidFactory::new_random_node()),
         events: events::event_bus(),
@@ -413,7 +416,9 @@ pub fn build_router(state: AppState) -> axum::Router {
         .layer(axum::middleware::from_fn(
             http::security_headers::security_headers_middleware,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new(SharedClassifier::new(
+            http::request_trace::FailuresExceptDeliberateRefusals,
+        )))
         .layer(axum::middleware::from_fn(http::offload::offload_middleware));
 
     // outermost: preflight OPTIONS must be answered before the auth middleware runs

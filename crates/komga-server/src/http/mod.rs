@@ -9,5 +9,6 @@ pub mod etag;
 pub mod headers;
 pub mod offload;
 pub mod pagination;
+pub mod request_trace;
 pub mod security_headers;
 pub mod www_authenticate;

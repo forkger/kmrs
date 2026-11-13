@@ -91,17 +91,18 @@ async fn update_my_password(
     Json(body): Json<PasswordUpdateDto>,
 ) -> Result<StatusCode, ApiError> {
     validate_password(&body.password)?;
-    let dao = user_dao(&state);
-    let mut user = dao
-        .find_by_email_ignore_case(&auth.0.user.email)?
-        .ok_or_else(|| ApiError::not_found(""))?;
-    user.password =
+    let password =
         bcrypt::hash(&body.password, 10).map_err(|e| ApiError::Internal(e.to_string()))?;
-    dao.update(&user)?;
-    // changing your own password keeps the current session (KomgaUserLifecycle semantics)
+    let (user, expire_session) =
+        state
+            .user_auth
+            .update_user(&auth.0.user.id, &auth.0.user.id, |user| {
+                user.password = password;
+                Ok(())
+            })?;
     let _ = state.events.send(DomainEvent::UserUpdated {
         user,
-        expire_session: false,
+        expire_session,
     });
     Ok(StatusCode::NO_CONTENT)
 }
@@ -217,61 +218,48 @@ async fn update_user(
     if auth.0.user.id == id {
         return Err(ApiError::forbidden(""));
     }
-    let dao = user_dao(&state);
-    let mut existing = dao
-        .find_by_id(&id)?
-        .ok_or_else(|| ApiError::not_found(""))?;
-    let before = existing.clone();
-
-    if let Some(roles) = &patch.roles {
-        // komga NPEs on explicit null (roles!!); aligned here as a 500
-        let roles = roles
-            .as_ref()
-            .ok_or_else(|| ApiError::Internal("null value for roles".into()))?;
-        existing.roles = values_of(&roles.iter().cloned().collect::<Vec<_>>());
-    }
-    if let Some(shared) = &patch.shared_libraries {
-        let shared = shared
-            .as_ref()
-            .ok_or_else(|| ApiError::Internal("null value for sharedLibraries".into()))?;
-        existing.shared_all_libraries = shared.all;
-        existing.shared_libraries_ids = if shared.all {
-            BTreeSet::new()
-        } else {
-            shared.library_ids.clone()
-        };
-    }
-    let restrictions = &mut existing.restrictions;
-    if let Some(age_restriction) = &patch.age_restriction {
-        restrictions.age_restriction = age_restriction_of(*age_restriction);
-    }
-    if let Some(labels) = &patch.labels_allow {
-        restrictions.labels_allow =
-            komga_core::model::user::lower_not_blank(labels.clone().unwrap_or_default());
-    }
-    if let Some(labels) = &patch.labels_exclude {
-        restrictions.labels_exclude =
-            komga_core::model::user::lower_not_blank(labels.clone().unwrap_or_default());
-    }
-    // ContentRestrictions construction semantics: allow minus exclude
-    existing.restrictions = ContentRestrictions::new(
-        existing.restrictions.age_restriction,
-        existing.restrictions.labels_allow.clone(),
-        existing.restrictions.labels_exclude.clone(),
-    );
-
-    dao.update(&existing)?;
-    // only permission/sharing changes invalidate sessions (KomgaUserLifecycle semantics)
-    let expire_sessions = before.roles != existing.roles
-        || before.restrictions != existing.restrictions
-        || before.shared_all_libraries != existing.shared_all_libraries
-        || before.shared_libraries_ids != existing.shared_libraries_ids;
-    if expire_sessions {
-        state.sessions.invalidate_user(&id)?;
-    }
+    let (user, expire_session) = state.user_auth.update_user(&id, &auth.0.user.id, |user| {
+        if let Some(roles) = &patch.roles {
+            // komga NPEs on explicit null (roles!!); aligned here as a 500
+            let roles = roles
+                .as_ref()
+                .ok_or_else(|| ApiError::Internal("null value for roles".into()))?;
+            user.roles = values_of(&roles.iter().cloned().collect::<Vec<_>>());
+        }
+        if let Some(shared) = &patch.shared_libraries {
+            let shared = shared
+                .as_ref()
+                .ok_or_else(|| ApiError::Internal("null value for sharedLibraries".into()))?;
+            user.shared_all_libraries = shared.all;
+            user.shared_libraries_ids = if shared.all {
+                BTreeSet::new()
+            } else {
+                shared.library_ids.clone()
+            };
+        }
+        let restrictions = &mut user.restrictions;
+        if let Some(age_restriction) = &patch.age_restriction {
+            restrictions.age_restriction = age_restriction_of(*age_restriction);
+        }
+        if let Some(labels) = &patch.labels_allow {
+            restrictions.labels_allow =
+                komga_core::model::user::lower_not_blank(labels.clone().unwrap_or_default());
+        }
+        if let Some(labels) = &patch.labels_exclude {
+            restrictions.labels_exclude =
+                komga_core::model::user::lower_not_blank(labels.clone().unwrap_or_default());
+        }
+        // ContentRestrictions construction semantics: allow minus exclude
+        user.restrictions = ContentRestrictions::new(
+            user.restrictions.age_restriction,
+            user.restrictions.labels_allow.clone(),
+            user.restrictions.labels_exclude.clone(),
+        );
+        Ok(())
+    })?;
     let _ = state.events.send(DomainEvent::UserUpdated {
-        user: existing,
-        expire_session: expire_sessions,
+        user,
+        expire_session,
     });
     Ok(StatusCode::NO_CONTENT)
 }
@@ -285,12 +273,7 @@ async fn delete_user(
     if auth.0.user.id == id {
         return Err(ApiError::forbidden(""));
     }
-    let dao = user_dao(&state);
-    let user = dao
-        .find_by_id(&id)?
-        .ok_or_else(|| ApiError::not_found(""))?;
-    dao.delete(&id, &user.email)?;
-    state.sessions.invalidate_user(&id)?;
+    let user = state.user_auth.delete_user(&id)?;
     // Java publishes UserUpdated (not UserDeleted) on delete, with sessions expired
     let _ = state.events.send(DomainEvent::UserUpdated {
         user,
@@ -309,21 +292,15 @@ async fn update_password_by_id(
     if !auth.0.is_admin() && auth.0.user.id != id {
         return Err(ApiError::forbidden(""));
     }
-    let dao = user_dao(&state);
-    let mut user = dao
-        .find_by_id(&id)?
-        .ok_or_else(|| ApiError::not_found(""))?;
-    user.password =
+    let password =
         bcrypt::hash(&body.password, 10).map_err(|e| ApiError::Internal(e.to_string()))?;
-    dao.update(&user)?;
-    // changing someone else's password invalidates their sessions; changing your own does not
-    let expire_sessions = auth.0.user.id != id;
-    if expire_sessions {
-        state.sessions.invalidate_user(&id)?;
-    }
+    let (user, expire_session) = state.user_auth.update_user(&id, &auth.0.user.id, |user| {
+        user.password = password;
+        Ok(())
+    })?;
     let _ = state.events.send(DomainEvent::UserUpdated {
         user,
-        expire_session: expire_sessions,
+        expire_session,
     });
     Ok(StatusCode::NO_CONTENT)
 }
@@ -835,6 +812,173 @@ mod tests {
             settled_activity_count(&state, &user_id, "admin@example.com", 2).await,
             2
         );
+    }
+
+    /// After repeated wrong passwords from one address the account refuses password logins
+    /// from it, even the right password, with the same 401 and no session. The refusal is recorded in the activity,
+    /// and a device that is already signed in keeps working.
+    #[tokio::test]
+    async fn repeated_wrong_passwords_lock_password_logins() {
+        let (state, _rx) = test_state();
+        let user_id = seed_user(&state, "admin@example.com");
+        let session_id = state.sessions.create(&user_id).unwrap();
+        let app = test_router(state.clone());
+
+        for _ in 0..5 {
+            let response = app
+                .clone()
+                .oneshot(basic_request("admin@example.com:wrong", None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = app
+            .clone()
+            .oneshot(basic_request("admin@example.com:pass", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get("set-cookie").is_none());
+        assert_eq!(state.sessions.all().unwrap().len(), 1);
+
+        assert_eq!(
+            settled_activity_count(&state, &user_id, "admin@example.com", 6).await,
+            6
+        );
+        let (activities, _) = UserDao::new(state.db.clone())
+            .find_activities_by_user(&user_id, "admin@example.com", None, 0)
+            .unwrap();
+        let refused: Vec<_> = activities
+            .iter()
+            .filter(|a| a.error.as_deref() == Some("Too many failed attempts"))
+            .collect();
+        assert_eq!(refused.len(), 1);
+        assert!(!refused[0].success);
+        // the refusal names the account, which is known at that point
+        assert_eq!(refused[0].user_id.as_deref(), Some(user_id.as_str()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v2/users/me")
+                    .header("X-Auth-Token", session_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A lock belongs to the address that was guessing: the same account still signs in
+    /// from another address, while the right password from the locked one stays refused.
+    #[tokio::test]
+    async fn a_lock_does_not_reach_the_accounts_other_addresses() {
+        let (state, _rx) = test_state();
+        seed_user(&state, "admin@example.com");
+        let app = test_router(state.clone());
+        let from = |peer: &str, credentials: &str| {
+            let mut request = basic_request(credentials, None);
+            let peer = std::net::SocketAddr::new(peer.parse().unwrap(), 40000);
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+            request
+        };
+
+        for _ in 0..5 {
+            let response = app
+                .clone()
+                .oneshot(from("203.0.113.9", "admin@example.com:wrong"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = app
+            .clone()
+            .oneshot(from("203.0.113.9", "admin@example.com:pass"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .clone()
+            .oneshot(from("198.51.100.7", "admin@example.com:pass"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // the success elsewhere does not lift the lock
+        let response = app
+            .oneshot(from("203.0.113.9", "admin@example.com:pass"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The lock comes before the cache: a source that was locked for guessing is refused
+    /// even with a password that was checked from that address just before.
+    #[tokio::test]
+    async fn a_locked_source_is_refused_whatever_was_checked_before() {
+        let (state, _rx) = test_state();
+        seed_user(&state, "admin@example.com");
+        let app = test_router(state.clone());
+        let status = |credentials: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(basic_request(credentials, None))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        assert_eq!(status("admin@example.com:pass").await, StatusCode::OK);
+        for _ in 0..5 {
+            assert_eq!(
+                status("admin@example.com:wrong").await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            status("admin@example.com:pass").await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// A user who changes their own password keeps their sessions, and still the old
+    /// password stops working at once: what was remembered belongs to the old hash.
+    #[tokio::test]
+    async fn a_changed_password_is_checked_again() {
+        let (state, _rx) = test_state();
+        seed_user(&state, "admin@example.com");
+        let app = test_router(state.clone());
+        let status = |credentials: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(basic_request(credentials, None))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        assert_eq!(status("admin@example.com:pass").await, StatusCode::OK);
+        let mut change = basic_request("admin@example.com:pass", None);
+        *change.method_mut() = axum::http::Method::PATCH;
+        *change.uri_mut() = "/api/v2/users/me/password".parse().unwrap();
+        change.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        *change.body_mut() = Body::from(r#"{"password":"newpass123"}"#);
+        let response = app.clone().oneshot(change).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        assert_eq!(
+            status("admin@example.com:pass").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(status("admin@example.com:newpass123").await, StatusCode::OK);
     }
 
     /// Clients that log in with Basic alone (KMReader keeps the returned token) still get a

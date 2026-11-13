@@ -33,6 +33,7 @@ pub struct AppState {
     /// (graceful shutdown waits for them)
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub api_key_activity_throttle: Arc<crate::auth::ApiKeyActivityThrottle>,
+    pub(crate) user_auth: Arc<crate::auth::UserAuthentication>,
     pub latest_update: crate::service::update_check::LatestUpdate,
 }
 
@@ -78,6 +79,7 @@ pub(crate) fn test_app_state(
     kmrs_db: Database,
 ) -> (AppState, tokio::sync::watch::Receiver<bool>) {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let sessions = SessionStore::new(config.session_timeout);
     let state = AppState {
         config: Arc::new(config.clone()),
         db: db.clone(),
@@ -85,7 +87,8 @@ pub(crate) fn test_app_state(
         task_db: db.clone(),
         tasks_db: tasks_db.clone(),
         kmrs_db: kmrs_db.clone(),
-        sessions: SessionStore::new(config.session_timeout),
+        sessions: sessions.clone(),
+        user_auth: Arc::new(crate::auth::UserAuthentication::new(db.clone(), sessions)),
         settings: Arc::new(SettingsProvider::load(db.clone())),
         tsid: Arc::new(TsidFactory::new_random_node()),
         events: crate::events::event_bus(),
