@@ -62,12 +62,14 @@ export function PosterManager({
   kind,
   entityId,
   title,
+  onChange,
 }: {
   open: boolean
   onClose: () => void
   kind: PosterKind
   entityId: string
   title: string
+  onChange?: () => void
 }) {
   const { t } = useTranslation('metadata')
   const queryClient = useQueryClient()
@@ -93,6 +95,7 @@ export function PosterManager({
     queryClient.invalidateQueries({ queryKey: ['posters', kind, entityId] })
     for (const key of INVALIDATE[kind]) queryClient.invalidateQueries({ queryKey: key })
     bump(entityId)
+    onChange?.()
   }
   const onError = (err: unknown) => setErrors([err instanceof Error ? err.message : t('poster.operationFailed')])
 

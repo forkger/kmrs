@@ -27,7 +27,7 @@ import { komfApi } from '@/lib/api/komf'
 import { canDownload, isAdmin, useAuthStore } from '@/lib/store/auth'
 import { useDocumentTitle } from '@/lib/hooks/useDocumentTitle'
 import { useKomfIntegration } from '@/lib/hooks/useKomfIntegration'
-import { useBust } from '@/lib/store/thumbnails'
+import { useBust, useThumbnailBust } from '@/lib/store/thumbnails'
 import { urls } from '@/lib/utils/urls'
 import { readRoute } from '@/lib/utils/nav'
 import { convertErrorCodes, mediaIssue } from '@/lib/utils/mediaStatus'
@@ -105,6 +105,7 @@ export function OneshotDetailPage() {
   })
   const book = bookQuery.data ?? null
   const bust = useBust(seriesId)
+  const bump = useThumbnailBust((s) => s.bump)
 
   const librariesQuery = useQuery({ queryKey: ['libraries'], queryFn: librariesApi.list })
   const collectionsQuery = useQuery({
@@ -466,7 +467,14 @@ export function OneshotDetailPage() {
           />
         </>
       )}
-      <PosterManager open={postersOpen} onClose={() => setPostersOpen(false)} kind="series" entityId={series.id} title={title} />
+      <PosterManager
+        open={postersOpen}
+        onClose={() => setPostersOpen(false)}
+        kind="book"
+        entityId={book.id}
+        title={title}
+        onChange={() => bump(series.id)}
+      />
       <ConfirmDeleteDialog
         open={deleteOpen}
         onOpenChange={setDeleteOpen}
