@@ -13,4 +13,5 @@ pub mod offload;
 pub mod pagination;
 pub mod request_trace;
 pub mod security_headers;
+pub mod serve;
 pub mod www_authenticate;

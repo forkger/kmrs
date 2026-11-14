@@ -51,6 +51,8 @@ tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = "0.1"
 futures-util = "0.3"
 http-body = "1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server-graceful", "http1", "tokio"] }
 flate2.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "gzip", "stream"] }
 # debug-embed: debug builds embed at compile time too — the shipped binary never reads

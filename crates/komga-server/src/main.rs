@@ -328,19 +328,18 @@ async fn run() -> anyhow::Result<()> {
     if first_run && tray.is_some() {
         tray::open_in_browser(state.config.port);
     }
-    let serve_result = axum::serve(
+    http::serve::serve(
         listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        app,
+        shutdown_signal(shutdown_rx, state.shutdown_tx.clone()),
     )
-    .with_graceful_shutdown(shutdown_signal(shutdown_rx, state.shutdown_tx.clone()))
     .await;
-    // the tray stands for a serving server: it goes as soon as serving ends, on
-    // the error path too, not after the task drain below
+    // the tray stands for a serving server: it goes as soon as serving ends,
+    // not after the task drain below
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     if let Some(tray) = tray {
         tray.stop();
     }
-    serve_result?;
 
     update_check.abort();
     // stop the supervisor between drains, then give the claimed tasks a bounded grace
