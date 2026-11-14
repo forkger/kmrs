@@ -1493,6 +1493,68 @@ pub(crate) mod tests {
         assert_eq!(stored, serde_json::json!([]));
     }
 
+    /// A request whose body stops arriving is answered with 408 by the server's own
+    /// router and changes nothing; one that fails authentication is still refused at
+    /// once, and a slow upload that keeps arriving is stored. The limit is the one from
+    /// the configuration, and turning it off there turns it off.
+    #[tokio::test]
+    async fn a_body_that_stops_arriving_is_given_up_on() {
+        let state = test_state();
+        seed_base(&state.db);
+        use crate::http::body_timeout::testing::{
+            assert_body_timed_out, send_stalled_to_server, send_to_server,
+            send_to_server_without_limit, with_pauses, SHORT_IDLE_TIMEOUT,
+        };
+        let thumbnails = "/api/v1/collections/c1/thumbnails";
+        let stored_thumbnails = || async {
+            let (_, _, body) = call(&state, router(), get(thumbnails, ADMIN_KEY)).await;
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+
+        let request = multipart_request(thumbnails, ADMIN_KEY, &tiny_jpeg(), None);
+        let (status, body) = send_stalled_to_server(&state, request).await;
+        assert_body_timed_out(status, &body, thumbnails);
+        assert_eq!(stored_thumbnails().await, serde_json::json!([]));
+
+        let create = r#"{"name":"Never arrives","ordered":false,"seriesIds":["s1"]}"#;
+        let request = json_request("POST", "/api/v1/collections", ADMIN_KEY, create);
+        let (status, body) = send_stalled_to_server(&state, request).await;
+        assert_body_timed_out(status, &body, "/api/v1/collections");
+        let (_, _, body) = call(
+            &state,
+            router(),
+            get("/api/v1/collections?search=Never", ADMIN_KEY),
+        )
+        .await;
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["totalElements"], 0);
+
+        // no body is read for a request that is not signed in: no wait, the usual 401
+        let request = json_request("POST", "/api/v1/collections", "no-such-key", create);
+        let (status, _) = send_stalled_to_server(&state, request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // slower in total than the limit, with no pause that reaches it
+        let request = multipart_request(thumbnails, ADMIN_KEY, &tiny_jpeg(), None);
+        let (parts, body) = request.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let body = with_pauses(body.to_vec(), 12, SHORT_IDLE_TIMEOUT / 5);
+        let (status, _) = send_to_server(&state, Request::from_parts(parts, body)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stored_thumbnails().await.as_array().unwrap().len(), 1);
+
+        // with the limit turned off in the configuration, a pause longer than it is
+        // waited out
+        let request = multipart_request(thumbnails, ADMIN_KEY, &tiny_jpeg(), None);
+        let (parts, body) = request.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let body = with_pauses(body.to_vec(), 2, 2 * SHORT_IDLE_TIMEOUT);
+        let (status, _) =
+            send_to_server_without_limit(&state, Request::from_parts(parts, body)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stored_thumbnails().await.as_array().unwrap().len(), 2);
+    }
+
     /// The limit as the server applies it, through the whole router: a cover of exactly
     /// the advertised size uploads, one byte more and a too-large JSON body are refused
     /// with a complete error body.

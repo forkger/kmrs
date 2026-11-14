@@ -396,7 +396,12 @@ pub fn build_router(state: AppState) -> axum::Router {
     #[cfg(all(feature = "profiling", unix))]
     let routes = routes.merge(profiling::router());
 
-    let app = http::body_limit::apply(routes.fallback(webui::fallback))
+    let app = http::body_limit::apply(routes.fallback(webui::fallback));
+    let app = match state.config.body_idle_timeout {
+        Some(idle) => http::body_timeout::apply(app, idle),
+        None => app,
+    };
+    let app = app
         .layer(axum::middleware::from_fn(
             http::error_path::error_path_middleware,
         ))

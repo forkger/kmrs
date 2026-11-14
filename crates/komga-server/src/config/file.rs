@@ -97,6 +97,9 @@ pub struct FileServer {
     /// reverse proxies whose X-Forwarded-For is honored, as addresses and CIDR ranges;
     /// None = loopback and the private ranges, an empty list = none
     pub trusted_proxies: Option<Vec<String>>,
+    /// how long a request body may stall before the request is given up on;
+    /// None = 60 seconds, zero = never
+    pub body_idle_timeout: Option<ConfigDuration>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -241,7 +244,10 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
                 .trim()
                 .parse()
                 .map_err(|_| format!("invalid duration {s:?}"))?;
-            return Ok(Duration::from_millis(n * millis));
+            return n
+                .checked_mul(millis)
+                .map(Duration::from_millis)
+                .ok_or_else(|| format!("duration {s:?} is too large"));
         }
     }
     Err(format!(
@@ -341,6 +347,16 @@ pub fn render(file: &FileConfig, config: &ServerConfig, source: Option<&Path>) -
                     &crate::http::client_addr::DEFAULT_TRUSTED_PROXIES.map(str::to_string)
                 ),
             }
+        ),
+    );
+    push_line(
+        &mut out,
+        fserver.and_then(|s| s.body_idle_timeout).is_some(),
+        format!(
+            "body-idle-timeout = {} # env: KOMGA_BODY_IDLE_TIMEOUT; how long a request body may stall before the request is answered with 408; \"30s\"/\"1m\"/\"5m\", bare integer = seconds, 0 = never give up",
+            q(&format_duration(
+                config.body_idle_timeout.unwrap_or(Duration::ZERO)
+            ))
         ),
     );
     out.push('\n');
@@ -859,6 +875,8 @@ mod tests {
             Duration::from_secs(7 * 86400)
         );
         assert!(parse_duration("7").is_err());
+        // too large to count in milliseconds: refused, not wrapped around
+        assert!(parse_duration("18446744073709552s").is_err());
         assert!(parse_duration("abc").is_err());
     }
 

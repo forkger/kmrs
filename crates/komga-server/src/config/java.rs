@@ -198,6 +198,7 @@ impl JavaConfig {
                 jdbc_session_enabled: None,
                 sort_locale: None,
                 trusted_proxies: None,
+                body_idle_timeout: None,
             });
         }
 

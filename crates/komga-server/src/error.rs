@@ -53,6 +53,13 @@ impl ApiError {
         }
     }
 
+    pub fn request_timeout(message: impl Into<String>) -> Self {
+        Self::Status {
+            status: StatusCode::REQUEST_TIMEOUT,
+            message: message.into(),
+        }
+    }
+
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::Status {
             status: StatusCode::BAD_REQUEST,

@@ -2,6 +2,7 @@
 
 pub mod base_url;
 pub mod body_limit;
+pub mod body_timeout;
 pub mod cache;
 pub mod client_addr;
 pub mod cors;
