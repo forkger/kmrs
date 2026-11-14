@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 
-/** raw pull distance that commits the jump to the adjacent book */
-const PULL_THRESHOLD = 160
+/** raw pull distance that commits the jump to the adjacent book: the strip is fully slid
+ *  in by ~70px of raw pull, so a longer threshold spends the rest of the gesture blind */
+const PULL_THRESHOLD = 96
 /** rubber-band ceiling: the visible offset compresses toward this, never past it */
 const RUBBER_MAX = 240
 /** wheel inertia must go quiet at the edge this long before wheeling may pull */
