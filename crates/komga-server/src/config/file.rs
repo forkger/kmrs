@@ -100,6 +100,9 @@ pub struct FileServer {
     /// how long a request body may stall before the request is given up on;
     /// None = 60 seconds, zero = never
     pub body_idle_timeout: Option<ConfigDuration>,
+    /// how long a connection may take to send the head of a request before it is
+    /// closed; None = 3 minutes, zero = never
+    pub header_read_timeout: Option<ConfigDuration>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -356,6 +359,16 @@ pub fn render(file: &FileConfig, config: &ServerConfig, source: Option<&Path>) -
             "body-idle-timeout = {} # env: KOMGA_BODY_IDLE_TIMEOUT; how long a request body may stall before the request is answered with 408; \"30s\"/\"1m\"/\"5m\", bare integer = seconds, 0 = never give up",
             q(&format_duration(
                 config.body_idle_timeout.unwrap_or(Duration::ZERO)
+            ))
+        ),
+    );
+    push_line(
+        &mut out,
+        fserver.and_then(|s| s.header_read_timeout).is_some(),
+        format!(
+            "header-read-timeout = {} # env: KOMGA_HEADER_READ_TIMEOUT; how long a connection may take to send the headers of a request, counted also while it sits idle between requests, before it is closed; \"30s\"/\"1m\"/\"5m\", bare integer = seconds, 0 = never close. Behind a reverse proxy keep it above the time the proxy holds idle connections to the server",
+            q(&format_duration(
+                config.header_read_timeout.unwrap_or(Duration::ZERO)
             ))
         ),
     );

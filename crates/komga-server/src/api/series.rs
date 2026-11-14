@@ -1124,6 +1124,7 @@ mod tests {
             sort_locale: None,
             trusted_proxies: Default::default(),
             body_idle_timeout: Some(crate::http::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT),
+            header_read_timeout: Some(crate::http::serve::DEFAULT_HEADER_READ_TIMEOUT),
             thumbnail_storage: Default::default(),
             thumbnail_deep_etag: true,
         };

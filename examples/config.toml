@@ -18,6 +18,7 @@
 # sort-locale = "zh-CN" # env: KOMGA_SORT_LOCALE; BCP47 language tag for ICU sorting, empty/absent = root collation
 # trusted-proxies = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"] # env: KOMGA_TRUSTED_PROXIES (comma-separated; none = trust no one); reverse proxies whose X-Forwarded-For is honored, as addresses or CIDR ranges; from any other peer the header is ignored and the connection's address is used. Default: loopback and the private ranges; a list replaces it, and [] trusts no one
 # body-idle-timeout = "1m" # env: KOMGA_BODY_IDLE_TIMEOUT; how long a request body may stall before the request is answered with 408; "30s"/"1m"/"5m", bare integer = seconds, 0 = never give up
+# header-read-timeout = "3m" # env: KOMGA_HEADER_READ_TIMEOUT; how long a connection may take to send the headers of a request, counted also while it sits idle between requests, before it is closed; "30s"/"1m"/"5m", bare integer = seconds, 0 = never close. Behind a reverse proxy keep it above the time the proxy holds idle connections to the server
 
 [cors]
 # allowed-origins = [] # env: KOMGA_CORS_ALLOWEDORIGINS (comma-separated)

@@ -101,6 +101,11 @@ pub struct ServerConfig {
     /// (kmrs enhancement; in Java this is Tomcat's connection timeout, a container
     /// setting). 60 seconds unless configured; None = never give up
     pub body_idle_timeout: Option<Duration>,
+    /// how long a connection may take to send the head of a request, also while it
+    /// sits idle between requests, before it is closed (kmrs enhancement; in Java
+    /// this is Tomcat's connection and keep-alive timeout, a container setting).
+    /// 3 minutes unless configured; None = never close
+    pub header_read_timeout: Option<Duration>,
     /// substituted into the SQL migrations
     pub migration_placeholders: Placeholders,
 }
@@ -331,18 +336,15 @@ impl ServerConfig {
             None => crate::http::client_addr::TrustedProxies::private_networks(),
         };
 
-        // the variable takes what the file takes: a bare integer is seconds there too
-        let body_idle_timeout = env_get(env, "KOMGA_BODY_IDLE_TIMEOUT")
-            .map(|value| match value.trim().parse() {
-                Ok(seconds) => Ok(Duration::from_secs(seconds)),
-                Err(_) => file::parse_duration(value).map_err(anyhow::Error::msg),
-            })
-            .transpose()
-            .context("KOMGA_BODY_IDLE_TIMEOUT")?
+        // zero turns a time limit off
+        let body_idle_timeout = env_time_limit(env, "KOMGA_BODY_IDLE_TIMEOUT")?
             .or_else(|| server.and_then(|s| s.body_idle_timeout).map(|d| d.0))
             .unwrap_or(crate::http::body_timeout::DEFAULT_BODY_IDLE_TIMEOUT);
-        // zero turns the limit off
         let body_idle_timeout = Some(body_idle_timeout).filter(|idle| !idle.is_zero());
+        let header_read_timeout = env_time_limit(env, "KOMGA_HEADER_READ_TIMEOUT")?
+            .or_else(|| server.and_then(|s| s.header_read_timeout).map(|d| d.0))
+            .unwrap_or(crate::http::serve::DEFAULT_HEADER_READ_TIMEOUT);
+        let header_read_timeout = Some(header_read_timeout).filter(|limit| !limit.is_zero());
 
         let cors_allowed_origins = env_list(env, "KOMGA_CORS_ALLOWEDORIGINS")
             .or_else(|| {
@@ -378,6 +380,7 @@ impl ServerConfig {
             sort_locale,
             trusted_proxies,
             body_idle_timeout,
+            header_read_timeout,
             cors_allowed_origins,
             page_hashing: env_u32(env, "KOMGA_PAGEHASHING")
                 .or_else(|| {
@@ -740,6 +743,18 @@ fn env_get<'a>(env: &'a Env, key: &str) -> Option<&'a str> {
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.as_str())
         .filter(|v| !v.is_empty())
+}
+
+/// A time limit from the environment. It takes what the file takes: a duration
+/// string, or a bare integer as seconds.
+fn env_time_limit(env: &Env, key: &str) -> anyhow::Result<Option<Duration>> {
+    env_get(env, key)
+        .map(|value| match value.trim().parse() {
+            Ok(seconds) => Ok(Duration::from_secs(seconds)),
+            Err(_) => file::parse_duration(value).map_err(anyhow::Error::msg),
+        })
+        .transpose()
+        .with_context(|| key.to_string())
 }
 
 fn env_bool(env: &Env, key: &str) -> Option<bool> {
@@ -1516,6 +1531,96 @@ issuer-uri = "https://github.com"
         let (rendered, idle) = round_trip("[server]\nbody-idle-timeout = 0\n");
         assert!(rendered.contains("\nbody-idle-timeout = \"0ms\" #"));
         assert_eq!(idle, None);
+    }
+
+    #[test]
+    fn header_read_timeout_from_env_and_file() {
+        let default = Some(Duration::from_secs(180));
+        // default: 3 minutes
+        assert_eq!(
+            resolve("", Cli::default(), &[]).header_read_timeout,
+            default
+        );
+        // file value, as a duration string or as seconds
+        let config = resolve(
+            "[server]\nheader-read-timeout = \"5m\"\n",
+            Cli::default(),
+            &[],
+        );
+        assert_eq!(config.header_read_timeout, Some(Duration::from_secs(300)));
+        let config = resolve("[server]\nheader-read-timeout = 90\n", Cli::default(), &[]);
+        assert_eq!(config.header_read_timeout, Some(Duration::from_secs(90)));
+        // the environment wins over the file
+        let config = resolve(
+            "[server]\nheader-read-timeout = \"5m\"\n",
+            Cli::default(),
+            &env(&[("KOMGA_HEADER_READ_TIMEOUT", "10s")]),
+        );
+        assert_eq!(config.header_read_timeout, Some(Duration::from_secs(10)));
+        // zero turns the limit off, however it is written
+        for toml in ["header-read-timeout = 0", "header-read-timeout = \"0s\""] {
+            let config = resolve(&format!("[server]\n{toml}\n"), Cli::default(), &[]);
+            assert_eq!(config.header_read_timeout, None, "{toml}");
+        }
+        for off in ["0", "0s"] {
+            let config = resolve(
+                "",
+                Cli::default(),
+                &env(&[("KOMGA_HEADER_READ_TIMEOUT", off)]),
+            );
+            assert_eq!(config.header_read_timeout, None, "{off}");
+        }
+        // a bare integer is seconds in the environment as in the file
+        let config = resolve(
+            "",
+            Cli::default(),
+            &env(&[("KOMGA_HEADER_READ_TIMEOUT", "90")]),
+        );
+        assert_eq!(config.header_read_timeout, Some(Duration::from_secs(90)));
+        // a variable that is set but empty counts as unset, like the others
+        let config = resolve(
+            "[server]\nheader-read-timeout = \"5m\"\n",
+            Cli::default(),
+            &env(&[("KOMGA_HEADER_READ_TIMEOUT", "")]),
+        );
+        assert_eq!(config.header_read_timeout, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn invalid_header_read_timeout_is_a_startup_error() {
+        let error = ServerConfig::resolve(
+            None,
+            &Cli::default(),
+            &env(&[("KOMGA_HEADER_READ_TIMEOUT", "soon")]),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("KOMGA_HEADER_READ_TIMEOUT"));
+        assert!(
+            toml::from_str::<FileConfig>("[server]\nheader-read-timeout = \"soon\"\n").is_err()
+        );
+    }
+
+    #[test]
+    fn rendered_config_keeps_the_header_read_timeout() {
+        let round_trip = |toml: &str| {
+            let file: FileConfig = toml::from_str(toml).unwrap();
+            let config = ServerConfig::resolve(Some(&file), &Cli::default(), &[]).unwrap();
+            let rendered = file::render(&file, &config, None);
+            let reparsed: FileConfig = toml::from_str(&rendered).unwrap();
+            let config = ServerConfig::resolve(Some(&reparsed), &Cli::default(), &[]).unwrap();
+            (rendered, config.header_read_timeout)
+        };
+        // unset: the default is shown commented out and still applies
+        let (rendered, limit) = round_trip("");
+        assert!(rendered.contains("\n# header-read-timeout = \"3m\" #"));
+        assert_eq!(limit, Some(Duration::from_secs(180)));
+        // set: kept, and off stays off
+        let (rendered, limit) = round_trip("[server]\nheader-read-timeout = \"5m\"\n");
+        assert!(rendered.contains("\nheader-read-timeout = \"5m\" #"));
+        assert_eq!(limit, Some(Duration::from_secs(300)));
+        let (rendered, limit) = round_trip("[server]\nheader-read-timeout = 0\n");
+        assert!(rendered.contains("\nheader-read-timeout = \"0ms\" #"));
+        assert_eq!(limit, None);
     }
 
     #[test]

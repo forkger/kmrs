@@ -199,6 +199,7 @@ impl JavaConfig {
                 sort_locale: None,
                 trusted_proxies: None,
                 body_idle_timeout: None,
+                header_read_timeout: None,
             });
         }
 

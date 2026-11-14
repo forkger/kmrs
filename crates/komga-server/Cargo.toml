@@ -138,6 +138,8 @@ objc2-service-management = { version = "0.3", default-features = false, features
 tempfile = "3"
 
 [dev-dependencies]
+# test-util: a test lets an hour pass on a paused clock
+tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }
 tempfile = "3"
 http-body-util = "0.1"

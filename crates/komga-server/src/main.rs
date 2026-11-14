@@ -331,6 +331,7 @@ async fn run() -> anyhow::Result<()> {
     http::serve::serve(
         listener,
         app,
+        state.config.header_read_timeout,
         shutdown_signal(shutdown_rx, state.shutdown_tx.clone()),
     )
     .await;
